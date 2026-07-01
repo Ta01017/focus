@@ -3,19 +3,27 @@
 import argparse
 import copy
 import json
+import random
 from pathlib import Path
 
-import numpy as np
 import torch
 from accelerate import Accelerator
-from PIL import Image
-from safetensors.torch import save_file
+from safetensors.torch import load_file, save_file
 from torch.nn import functional as F
 from torch.utils.data import DataLoader
 
 from diffusers import Flux2KleinPipeline
 from diffusers.training_utils import compute_density_for_timestep_sampling, compute_loss_weighting_for_sd3
 
+from dof_utils import (
+    add_metadata_args,
+    add_pretrained_args,
+    load_trainer_state,
+    paired_preprocess,
+    pretrained_kwargs,
+    resolve_resume_checkpoint,
+    save_trainer_state,
+)
 from flux2_controlnet import Flux2ControlNetTransformer, Flux2FocusControlNet, parse_block_indices
 from focus_dataset import DiffSynthFocusDataset
 
@@ -23,10 +31,8 @@ from focus_dataset import DiffSynthFocusDataset
 def parse_args():
     parser = argparse.ArgumentParser(description="Train a FLUX.2 Klein focus ControlNet residual branch.")
     parser.add_argument("--model", default="black-forest-labs/FLUX.2-klein-4B")
-    parser.add_argument("--dataset_metadata_path", required=True)
-    parser.add_argument("--dataset_base_path", default=".")
-    parser.add_argument("--target_key", default="image")
-    parser.add_argument("--edit_key", default="edit_image")
+    add_metadata_args(parser, metadata_required=True)
+    add_pretrained_args(parser)
     parser.add_argument("--dataset_repeat", type=int, default=1)
     parser.add_argument("--control_index", type=int, choices=(2, 3), default=2)
     parser.add_argument("--prompt", default="a photorealistic all-in-focus photograph")
@@ -53,12 +59,13 @@ def parse_args():
     parser.add_argument("--focus_blur_weight", type=float, default=1.0)
     parser.add_argument("--focus_mask_gamma", type=float, default=1.0)
     parser.add_argument("--gradient_checkpointing", action="store_true")
+    parser.add_argument("--resume_from_checkpoint", default=None)
     parser.add_argument("--seed", type=int, default=0)
     parser.add_argument("--mixed_precision", choices=("no", "fp16", "bf16"), default="bf16")
     return parser.parse_args()
 
 
-def save_checkpoint(accelerator, model, directory, args, global_step):
+def save_checkpoint(accelerator, model, optimizer, directory, args, global_step, epoch, step_in_epoch):
     accelerator.wait_for_everyone()
     if not accelerator.is_main_process:
         return
@@ -90,6 +97,7 @@ def save_checkpoint(accelerator, model, directory, args, global_step):
     (directory / "controlnet_config.json").write_text(
         json.dumps(config, indent=2, ensure_ascii=False), encoding="utf-8"
     )
+    save_trainer_state(directory, optimizer, global_step, epoch, step_in_epoch)
 
 
 def main():
@@ -105,13 +113,16 @@ def main():
         mixed_precision=args.mixed_precision,
     )
     torch.manual_seed(args.seed)
+    random.seed(args.seed)
     weight_dtype = torch.float32
     if accelerator.device.type == "cuda" and args.mixed_precision == "bf16":
         weight_dtype = torch.bfloat16
     elif accelerator.device.type == "cuda" and args.mixed_precision == "fp16":
         weight_dtype = torch.float16
 
-    pipe = Flux2KleinPipeline.from_pretrained(args.model, torch_dtype=weight_dtype)
+    pipe = Flux2KleinPipeline.from_pretrained(
+        args.model, torch_dtype=weight_dtype, **pretrained_kwargs(args)
+    )
     transformer = pipe.transformer
     transformer.requires_grad_(False).eval()
     if args.gradient_checkpointing:
@@ -134,6 +145,12 @@ def main():
     transformer.to(accelerator.device, dtype=weight_dtype)
     controlnet.to(accelerator.device, dtype=torch.float32)
     optimizer = torch.optim.AdamW(controlnet.parameters(), lr=args.learning_rate, weight_decay=1e-2)
+    output_dir = Path(args.output_dir)
+    resume_path = resolve_resume_checkpoint(output_dir, args.resume_from_checkpoint)
+    resume_state = {"global_step": 0, "epoch": 0, "step_in_epoch": 0}
+    if resume_path is not None:
+        controlnet.load_state_dict(load_file(resume_path / "controlnet.safetensors"), strict=True)
+        resume_state = load_trainer_state(resume_path, optimizer)
     scheduler = copy.deepcopy(pipe.scheduler)
     latent_mean = pipe.vae.bn.running_mean.view(1, -1, 1, 1).to(accelerator.device, dtype=weight_dtype)
     latent_std = torch.sqrt(
@@ -149,28 +166,15 @@ def main():
         min_edit_images=args.control_index + 1,
         use_focus_maps=True,
         default_prompt=args.prompt,
+        prompt_key=args.prompt_key,
+        start_index=args.start_index,
+        max_samples=args.max_samples,
     )
 
     def collate_fn(samples):
-        focus_maps = torch.zeros(len(samples), 1, args.resolution, args.resolution)
-        for index, sample in enumerate(samples):
-            focus = sample["cond_images"][args.control_index].convert("L")
-            focus = focus.resize((args.resolution, args.resolution), Image.Resampling.BILINEAR)
-            focus_maps[index, 0] = torch.from_numpy(np.asarray(focus, dtype=np.float32) / 255.0)
-        preprocess = pipe.image_processor.preprocess
-        return {
-            "target": preprocess(
-                [sample["target"] for sample in samples], height=args.resolution, width=args.resolution
-            ),
-            "cond_a": preprocess(
-                [sample["cond_images"][0] for sample in samples], height=args.resolution, width=args.resolution
-            ),
-            "cond_b": preprocess(
-                [sample["cond_images"][1] for sample in samples], height=args.resolution, width=args.resolution
-            ),
-            "focus_map": focus_maps,
-            "prompts": [sample["prompt"] for sample in samples],
-        }
+        batch = paired_preprocess(samples, args.resolution, pipe.image_processor, training=True)
+        batch["focus_map"] = batch["focus_a"] if args.control_index == 2 else batch["focus_b"]
+        return batch
 
     dataloader = DataLoader(
         dataset,
@@ -181,7 +185,6 @@ def main():
         pin_memory=True,
     )
     model, optimizer, dataloader = accelerator.prepare(model, optimizer, dataloader)
-    output_dir = Path(args.output_dir)
     if accelerator.is_main_process:
         output_dir.mkdir(parents=True, exist_ok=True)
 
@@ -198,12 +201,15 @@ def main():
             sigma = sigma.unsqueeze(-1)
         return sigma
 
-    global_step = 0
-    epoch = 0
+    global_step = int(resume_state["global_step"])
+    epoch = int(resume_state["epoch"])
+    resume_step = int(resume_state["step_in_epoch"])
     while global_step < args.max_train_steps:
         if hasattr(dataloader.sampler, "set_epoch"):
             dataloader.sampler.set_epoch(epoch)
-        for batch in dataloader:
+        for step, batch in enumerate(dataloader):
+            if epoch == int(resume_state["epoch"]) and step < resume_step:
+                continue
             with accelerator.accumulate(model):
                 with torch.no_grad():
                     target = encode_latents(batch["target"])
@@ -279,12 +285,22 @@ def main():
                 global_step += 1
                 if accelerator.is_main_process and global_step % 10 == 0:
                     print(f"step={global_step} loss={loss.detach().item():.6f}")
-                if global_step % args.save_steps == 0:
-                    save_checkpoint(accelerator, model, output_dir / f"checkpoint-{global_step}", args, global_step)
+                if global_step % args.save_steps == 0 or global_step == args.max_train_steps:
+                    save_checkpoint(
+                        accelerator,
+                        model,
+                        optimizer,
+                        output_dir / f"checkpoint-{global_step}",
+                        args,
+                        global_step,
+                        epoch,
+                        step + 1,
+                    )
                 if global_step >= args.max_train_steps:
                     break
         epoch += 1
-    save_checkpoint(accelerator, model, output_dir, args, global_step)
+        resume_step = 0
+    save_checkpoint(accelerator, model, optimizer, output_dir, args, global_step, epoch, 0)
     accelerator.wait_for_everyone()
 
 

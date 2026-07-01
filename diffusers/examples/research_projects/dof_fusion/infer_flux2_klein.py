@@ -9,6 +9,8 @@ from PIL import Image
 
 from diffusers import Flux2KleinPipeline
 
+from dof_utils import add_metadata_args, add_pretrained_args, pretrained_kwargs
+
 
 DEFAULT_PROMPT = (
     "Create one photorealistic all-in-focus image from the two aligned reference photographs. "
@@ -31,6 +33,8 @@ def parse_args():
     parser.add_argument("--guidance_scale", type=float, default=1.0)
     parser.add_argument("--seed", type=int, default=0)
     parser.add_argument("--cpu_offload", action="store_true")
+    add_metadata_args(parser)
+    add_pretrained_args(parser)
     return parser.parse_args()
 
 
@@ -52,7 +56,7 @@ def main():
             training_config = json.loads(config_path.read_text(encoding="utf-8"))
     model = args.model or training_config.get("base_model", "black-forest-labs/FLUX.2-klein-4B")
     dtype = torch.bfloat16 if torch.cuda.is_available() and torch.cuda.is_bf16_supported() else torch.float16
-    pipe = Flux2KleinPipeline.from_pretrained(model, torch_dtype=dtype)
+    pipe = Flux2KleinPipeline.from_pretrained(model, torch_dtype=dtype, **pretrained_kwargs(args))
     if args.lora is not None:
         pipe.load_lora_weights(args.lora)
     if args.cpu_offload:

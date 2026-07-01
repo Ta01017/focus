@@ -10,6 +10,7 @@ from safetensors.torch import load_file
 
 from diffusers import Flux2KleinPipeline
 
+from dof_utils import add_metadata_args, add_pretrained_args, pretrained_kwargs
 from flux2_controlnet import Flux2ControlNetTransformer, Flux2FocusControlNet, focus_map_to_tokens
 from infer_flux2_klein import DEFAULT_PROMPT
 
@@ -29,12 +30,16 @@ def parse_args():
     parser.add_argument("--guidance_scale", type=float, default=1.0)
     parser.add_argument("--conditioning_scale", type=float, default=None)
     parser.add_argument("--seed", type=int, default=0)
+    add_metadata_args(parser)
+    add_pretrained_args(parser)
     return parser.parse_args()
 
 
-def load_pipeline(checkpoint, model_id, dtype, conditioning_scale):
+def load_pipeline(checkpoint, model_id, dtype, conditioning_scale, pretrained_options):
     config = json.loads((checkpoint / "controlnet_config.json").read_text(encoding="utf-8"))
-    pipe = Flux2KleinPipeline.from_pretrained(model_id or config["base_model"], torch_dtype=dtype).to("cuda")
+    pipe = Flux2KleinPipeline.from_pretrained(
+        model_id or config["base_model"], torch_dtype=dtype, **pretrained_options
+    ).to("cuda")
     controlnet = Flux2FocusControlNet(
         in_channels=config["in_channels"],
         inner_dim=config["inner_dim"],
@@ -59,7 +64,7 @@ def main():
         raise ValueError("--height and --width must be divisible by 16.")
     dtype = torch.bfloat16 if torch.cuda.is_bf16_supported() else torch.float16
     pipe, transformer, _ = load_pipeline(
-        Path(args.checkpoint), args.model, dtype, args.conditioning_scale
+        Path(args.checkpoint), args.model, dtype, args.conditioning_scale, pretrained_kwargs(args)
     )
     image_a = Image.open(args.image_a).convert("RGB")
     image_b = Image.open(args.image_b).convert("RGB")

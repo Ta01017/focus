@@ -4,6 +4,7 @@ set -euo pipefail
 SCRIPT_DIR=$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd)
 
 MODE=${MODE:-all} # train | infer | batch | all
+# 第一阶段 E4：SANA-Sprint img2img，默认从 A 初始化。
 MODEL=${MODEL:-Efficient-Large-Model/Sana_Sprint_0.6B_1024px_diffusers}
 DATASET_BASE_PATH=${DATASET_BASE_PATH:-data}
 METADATA=${METADATA:-${DATASET_BASE_PATH}/metadata.json}
@@ -21,6 +22,19 @@ MIXED_PRECISION=${MIXED_PRECISION:-bf16}
 USE_FOCUS_MAPS=${USE_FOCUS_MAPS:-0}
 FOCUS_LOSS_WEIGHT=${FOCUS_LOSS_WEIGHT:-0.0}
 SEED=${SEED:-0}
+CACHE_DIR=${CACHE_DIR:-}
+REVISION=${REVISION:-}
+LOCAL_FILES_ONLY=${LOCAL_FILES_ONLY:-0}
+RESUME_FROM_CHECKPOINT=${RESUME_FROM_CHECKPOINT:-}
+
+pretrained_args=()
+if [[ "${LOCAL_FILES_ONLY}" == "1" ]]; then pretrained_args+=(--local_files_only); fi
+if [[ -n "${CACHE_DIR}" ]]; then pretrained_args+=(--cache_dir "${CACHE_DIR}"); fi
+if [[ -n "${REVISION}" ]]; then pretrained_args+=(--revision "${REVISION}"); fi
+resume_args=()
+if [[ -n "${RESUME_FROM_CHECKPOINT}" ]]; then
+  resume_args+=(--resume_from_checkpoint "${RESUME_FROM_CHECKPOINT}")
+fi
 
 run_train() {
   local focus_args=()
@@ -37,7 +51,9 @@ run_train() {
     --gradient_accumulation_steps "${GRAD_ACCUM_STEPS}" \
     --max_train_steps "${MAX_TRAIN_STEPS}" \
     --mixed_precision "${MIXED_PRECISION}" \
-    "${focus_args[@]}"
+    "${focus_args[@]}" \
+    "${resume_args[@]}" \
+    "${pretrained_args[@]}"
 }
 
 run_infer() {
@@ -52,7 +68,8 @@ run_infer() {
     --width "${RESOLUTION}" \
     --steps "${INFER_STEPS}" \
     --strength "${STRENGTH}" \
-    --seed "${SEED}"
+    --seed "${SEED}" \
+    "${pretrained_args[@]}"
 }
 
 run_batch() {
@@ -67,7 +84,8 @@ run_batch() {
     --batch_size "${BATCH_SIZE}" \
     --steps "${INFER_STEPS}" \
     --strength "${STRENGTH}" \
-    --seed "${SEED}"
+    --seed "${SEED}" \
+    "${pretrained_args[@]}"
 }
 
 case "${MODE}" in

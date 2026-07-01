@@ -2,30 +2,36 @@
 
 import argparse
 import json
+import random
 from pathlib import Path
 
-import numpy as np
 import torch
 from accelerate import Accelerator
-from PIL import Image
-from safetensors.torch import save_file
+from safetensors.torch import load_file, save_file
 from torch.nn import functional as F
 from torch.utils.data import DataLoader
 
-from diffusers import SanaSprintPipeline
+from diffusers import SanaControlNetModel, SanaSprintPipeline
 
+from dof_utils import (
+    add_metadata_args,
+    add_pretrained_args,
+    load_trainer_state,
+    paired_preprocess,
+    pretrained_kwargs,
+    resolve_resume_checkpoint,
+    save_trainer_state,
+)
 from focus_dataset import DiffSynthFocusDataset
-from sana_dof import DualImageConditionAdapter
+from sana_dof import DualImageConditionAdapter, encode_vae_latents
 from sana_sprint_controlnet import SanaSprintFocusControlNetTransformer, initialize_controlnet_from_transformer
 
 
 def parse_args():
     parser = argparse.ArgumentParser(description="Train SANA-Sprint with a focus-map ControlNet.")
     parser.add_argument("--model", default="Efficient-Large-Model/Sana_Sprint_0.6B_1024px_diffusers")
-    parser.add_argument("--dataset_metadata_path", required=True)
-    parser.add_argument("--dataset_base_path", default=".")
-    parser.add_argument("--target_key", default="image")
-    parser.add_argument("--edit_key", default="edit_image")
+    add_metadata_args(parser, metadata_required=True)
+    add_pretrained_args(parser)
     parser.add_argument("--dataset_repeat", type=int, default=1)
     parser.add_argument("--control_index", type=int, default=2, help="Index of the focus map in edit_image.")
     parser.add_argument("--prompt", default="a photorealistic all-in-focus photograph")
@@ -49,6 +55,7 @@ def parse_args():
     parser.add_argument("--gradient_checkpointing", action="store_true")
     parser.add_argument("--seed", type=int, default=0)
     parser.add_argument("--mixed_precision", choices=("no", "fp16", "bf16"), default="bf16")
+    parser.add_argument("--resume_from_checkpoint", default=None)
     return parser.parse_args()
 
 
@@ -63,7 +70,7 @@ def validate_args(args):
         raise ValueError("Focus loss weights must be non-negative.")
 
 
-def save_checkpoint(accelerator, model, save_directory: Path, args, global_step: int):
+def save_checkpoint(accelerator, model, optimizer, save_directory: Path, args, global_step, epoch, step_in_epoch):
     accelerator.wait_for_everyone()
     if not accelerator.is_main_process:
         return
@@ -91,6 +98,7 @@ def save_checkpoint(accelerator, model, save_directory: Path, args, global_step:
     (save_directory / "controlnet_config.json").write_text(
         json.dumps(config, indent=2, ensure_ascii=False), encoding="utf-8"
     )
+    save_trainer_state(save_directory, optimizer, global_step, epoch, step_in_epoch)
 
 
 def main():
@@ -101,6 +109,7 @@ def main():
         mixed_precision=args.mixed_precision,
     )
     torch.manual_seed(args.seed)
+    random.seed(args.seed)
 
     transformer_dtype = torch.float32
     if accelerator.device.type == "cuda" and args.mixed_precision == "bf16":
@@ -108,7 +117,9 @@ def main():
     elif accelerator.device.type == "cuda" and args.mixed_precision == "fp16":
         transformer_dtype = torch.float16
 
-    pipe = SanaSprintPipeline.from_pretrained(args.model, torch_dtype=transformer_dtype)
+    pipe = SanaSprintPipeline.from_pretrained(
+        args.model, torch_dtype=transformer_dtype, **pretrained_kwargs(args)
+    )
     pipe.transformer.requires_grad_(False)
     pipe.text_encoder.requires_grad_(False)
     pipe.vae.requires_grad_(False)
@@ -138,6 +149,16 @@ def main():
     adapter.to(accelerator.device, dtype=torch.float32)
     trainable_parameters = list(controlnet.parameters()) + list(adapter.parameters())
     optimizer = torch.optim.AdamW(trainable_parameters, lr=args.learning_rate, weight_decay=1e-2)
+    output_dir = Path(args.output_dir)
+    resume_path = resolve_resume_checkpoint(output_dir, args.resume_from_checkpoint)
+    resume_state = {"global_step": 0, "epoch": 0, "step_in_epoch": 0}
+    if resume_path is not None:
+        loaded_controlnet = SanaControlNetModel.from_pretrained(
+            resume_path / "controlnet", **pretrained_kwargs(args)
+        )
+        controlnet.load_state_dict(loaded_controlnet.state_dict(), strict=True)
+        adapter.load_state_dict(load_file(resume_path / "adapter.safetensors"), strict=True)
+        resume_state = load_trainer_state(resume_path, optimizer)
 
     dataset = DiffSynthFocusDataset(
         metadata_path=args.dataset_metadata_path,
@@ -148,30 +169,15 @@ def main():
         min_edit_images=args.control_index + 1,
         use_focus_maps=True,
         default_prompt=args.prompt,
+        prompt_key=args.prompt_key,
+        start_index=args.start_index,
+        max_samples=args.max_samples,
     )
 
-    def preprocess_focus_map(samples):
-        masks = torch.zeros(len(samples), 1, args.resolution, args.resolution, dtype=torch.float32)
-        for batch_index, sample in enumerate(samples):
-            focus = sample["cond_images"][args.control_index].convert("L")
-            focus = focus.resize((args.resolution, args.resolution), resample=Image.Resampling.BILINEAR)
-            masks[batch_index, 0] = torch.from_numpy(np.asarray(focus, dtype=np.float32) / 255.0)
-        return masks
-
     def collate_fn(samples):
-        return {
-            "target": pipe.image_processor.preprocess(
-                [sample["target"] for sample in samples], height=args.resolution, width=args.resolution
-            ),
-            "cond_a": pipe.image_processor.preprocess(
-                [sample["cond_images"][0] for sample in samples], height=args.resolution, width=args.resolution
-            ),
-            "cond_b": pipe.image_processor.preprocess(
-                [sample["cond_images"][1] for sample in samples], height=args.resolution, width=args.resolution
-            ),
-            "focus_map": preprocess_focus_map(samples),
-            "prompts": [sample["prompt"] for sample in samples],
-        }
+        batch = paired_preprocess(samples, args.resolution, pipe.image_processor, training=True)
+        batch["focus_map"] = batch["focus_a"] if args.control_index == 2 else batch["focus_b"]
+        return batch
 
     dataloader = DataLoader(
         dataset,
@@ -183,25 +189,26 @@ def main():
         drop_last=False,
     )
     model, optimizer, dataloader = accelerator.prepare(model, optimizer, dataloader)
-    output_dir = Path(args.output_dir)
     if accelerator.is_main_process:
         output_dir.mkdir(parents=True, exist_ok=True)
 
-    global_step = 0
-    epoch = 0
+    global_step = int(resume_state["global_step"])
+    epoch = int(resume_state["epoch"])
+    resume_step = int(resume_state["step_in_epoch"])
     while global_step < args.max_train_steps:
         dataloader.sampler.set_epoch(epoch) if hasattr(dataloader.sampler, "set_epoch") else None
-        for batch in dataloader:
+        for step, batch in enumerate(dataloader):
+            if epoch == int(resume_state["epoch"]) and step < resume_step:
+                continue
             with accelerator.accumulate(model):
                 with torch.no_grad():
                     target = batch["target"].to(accelerator.device, dtype=torch.float32)
                     cond_a = batch["cond_a"].to(accelerator.device, dtype=torch.float32)
                     cond_b = batch["cond_b"].to(accelerator.device, dtype=torch.float32)
                     focus_map = batch["focus_map"].to(accelerator.device, dtype=torch.float32).clamp(0, 1)
-                    scaling_factor = pipe.vae.config.scaling_factor
-                    target_latents = pipe.vae.encode(target).latent * scaling_factor
-                    cond_a_latents = pipe.vae.encode(cond_a).latent * scaling_factor
-                    cond_b_latents = pipe.vae.encode(cond_b).latent * scaling_factor
+                    target_latents = encode_vae_latents(pipe.vae, target)
+                    cond_a_latents = encode_vae_latents(pipe.vae, cond_a)
+                    cond_b_latents = encode_vae_latents(pipe.vae, cond_b)
                     prompt_embeds, prompt_attention_mask = pipe.encode_prompt(
                         batch["prompts"],
                         device=accelerator.device,
@@ -287,22 +294,25 @@ def main():
                 global_step += 1
                 if accelerator.is_main_process and global_step % 10 == 0:
                     print(f"step={global_step} loss={loss.detach().item():.6f}")
-                if global_step % args.save_steps == 0:
+                if global_step % args.save_steps == 0 or global_step == args.max_train_steps:
                     save_checkpoint(
                         accelerator,
                         model,
+                        optimizer,
                         output_dir / f"checkpoint-{global_step}",
                         args,
                         global_step,
+                        epoch,
+                        step + 1,
                     )
                 if global_step >= args.max_train_steps:
                     break
         epoch += 1
+        resume_step = 0
 
-    save_checkpoint(accelerator, model, output_dir, args, global_step)
+    save_checkpoint(accelerator, model, optimizer, output_dir, args, global_step, epoch, 0)
     accelerator.wait_for_everyone()
 
 
 if __name__ == "__main__":
     main()
-

@@ -3,14 +3,13 @@
 import argparse
 import copy
 import json
+import random
 from pathlib import Path
 
-import numpy as np
 import torch
 from accelerate import Accelerator
-from peft import LoraConfig
+from peft import LoraConfig, set_peft_model_state_dict
 from peft.utils import get_peft_model_state_dict
-from PIL import Image
 from torch.nn import functional as F
 from torch.utils.data import DataLoader
 
@@ -20,17 +19,25 @@ from diffusers.training_utils import (
     compute_density_for_timestep_sampling,
     compute_loss_weighting_for_sd3,
 )
+from diffusers.utils import convert_unet_state_dict_to_peft
 
+from dof_utils import (
+    add_metadata_args,
+    add_pretrained_args,
+    load_trainer_state,
+    paired_preprocess,
+    pretrained_kwargs,
+    resolve_resume_checkpoint,
+    save_trainer_state,
+)
 from focus_dataset import DiffSynthFocusDataset
 
 
 def parse_args():
     parser = argparse.ArgumentParser(description="Train FLUX.2 Klein LoRA for paired depth-of-field fusion.")
     parser.add_argument("--model", default="black-forest-labs/FLUX.2-klein-4B")
-    parser.add_argument("--dataset_metadata_path", required=True)
-    parser.add_argument("--dataset_base_path", default=".")
-    parser.add_argument("--target_key", default="image")
-    parser.add_argument("--edit_key", default="edit_image")
+    add_metadata_args(parser, metadata_required=True)
+    add_pretrained_args(parser)
     parser.add_argument("--dataset_repeat", type=int, default=1)
     parser.add_argument("--min_edit_images", type=int, default=2)
     focus_group = parser.add_mutually_exclusive_group()
@@ -61,6 +68,7 @@ def parse_args():
     parser.add_argument("--seed", type=int, default=0)
     parser.add_argument("--mixed_precision", choices=("no", "fp16", "bf16"), default="bf16")
     parser.add_argument("--gradient_checkpointing", action="store_true")
+    parser.add_argument("--resume_from_checkpoint", default=None)
     return parser.parse_args()
 
 
@@ -77,7 +85,7 @@ def validate_args(args):
         raise ValueError("Focus loss weights must be non-negative.")
 
 
-def save_lora(accelerator, transformer, save_directory: Path, args, global_step: int):
+def save_lora(accelerator, transformer, optimizer, save_directory, args, global_step, epoch, step_in_epoch):
     accelerator.wait_for_everyone()
     if not accelerator.is_main_process:
         return
@@ -106,6 +114,7 @@ def save_lora(accelerator, transformer, save_directory: Path, args, global_step:
     (save_directory / "training_config.json").write_text(
         json.dumps(config, indent=2, ensure_ascii=False), encoding="utf-8"
     )
+    save_trainer_state(save_directory, optimizer, global_step, epoch, step_in_epoch)
 
 
 def main():
@@ -116,6 +125,7 @@ def main():
         mixed_precision=args.mixed_precision,
     )
     torch.manual_seed(args.seed)
+    random.seed(args.seed)
 
     weight_dtype = torch.float32
     if accelerator.device.type == "cuda" and args.mixed_precision == "bf16":
@@ -123,7 +133,9 @@ def main():
     elif accelerator.device.type == "cuda" and args.mixed_precision == "fp16":
         weight_dtype = torch.float16
 
-    pipe = Flux2KleinPipeline.from_pretrained(args.model, torch_dtype=weight_dtype)
+    pipe = Flux2KleinPipeline.from_pretrained(
+        args.model, torch_dtype=weight_dtype, **pretrained_kwargs(args)
+    )
     transformer = pipe.transformer
     vae = pipe.vae
     scheduler = copy.deepcopy(pipe.scheduler)
@@ -160,6 +172,19 @@ def main():
 
     trainable_parameters = [parameter for parameter in transformer.parameters() if parameter.requires_grad]
     optimizer = torch.optim.AdamW(trainable_parameters, lr=args.learning_rate, weight_decay=1e-2)
+    output_dir = Path(args.output_dir)
+    resume_path = resolve_resume_checkpoint(output_dir, args.resume_from_checkpoint)
+    resume_state = {"global_step": 0, "epoch": 0, "step_in_epoch": 0}
+    if resume_path is not None:
+        lora_state = Flux2KleinPipeline.lora_state_dict(resume_path)
+        transformer_state = {
+            key.replace("transformer.", ""): value
+            for key, value in lora_state.items()
+            if key.startswith("transformer.")
+        }
+        transformer_state = convert_unet_state_dict_to_peft(transformer_state)
+        set_peft_model_state_dict(transformer, transformer_state, adapter_name="default")
+        resume_state = load_trainer_state(resume_path, optimizer)
     dataset = DiffSynthFocusDataset(
         metadata_path=args.dataset_metadata_path,
         base_path=args.dataset_base_path,
@@ -169,38 +194,13 @@ def main():
         min_edit_images=args.min_edit_images,
         use_focus_maps=args.use_focus_maps,
         default_prompt=args.prompt,
+        prompt_key=args.prompt_key,
+        start_index=args.start_index,
+        max_samples=args.max_samples,
     )
 
-    def preprocess_focus_maps(samples):
-        present = [len(sample["cond_images"]) > 2 for sample in samples]
-        if not any(present):
-            return None, None
-        masks = torch.zeros(len(samples), 1, args.resolution, args.resolution, dtype=torch.float32)
-        valid = torch.tensor(present, dtype=torch.float32)
-        for batch_index, sample in enumerate(samples):
-            if not present[batch_index]:
-                continue
-            focus = sample["cond_images"][2].convert("L")
-            focus = focus.resize((args.resolution, args.resolution), resample=Image.Resampling.BILINEAR)
-            masks[batch_index, 0] = torch.from_numpy(np.asarray(focus, dtype=np.float32) / 255.0)
-        return masks, valid
-
     def collate_fn(samples):
-        focus_a, focus_a_valid = preprocess_focus_maps(samples) if args.use_focus_maps else (None, None)
-        return {
-            "target": pipe.image_processor.preprocess(
-                [sample["target"] for sample in samples], height=args.resolution, width=args.resolution
-            ),
-            "cond_a": pipe.image_processor.preprocess(
-                [sample["cond_images"][0] for sample in samples], height=args.resolution, width=args.resolution
-            ),
-            "cond_b": pipe.image_processor.preprocess(
-                [sample["cond_images"][1] for sample in samples], height=args.resolution, width=args.resolution
-            ),
-            "focus_a": focus_a,
-            "focus_a_valid": focus_a_valid,
-            "prompts": [sample["prompt"] for sample in samples],
-        }
+        return paired_preprocess(samples, args.resolution, pipe.image_processor, training=True)
 
     dataloader = DataLoader(
         dataset,
@@ -212,7 +212,6 @@ def main():
         drop_last=False,
     )
     transformer, optimizer, dataloader = accelerator.prepare(transformer, optimizer, dataloader)
-    output_dir = Path(args.output_dir)
     if accelerator.is_main_process:
         output_dir.mkdir(parents=True, exist_ok=True)
 
@@ -225,11 +224,14 @@ def main():
             sigma = sigma.unsqueeze(-1)
         return sigma
 
-    global_step = 0
-    epoch = 0
+    global_step = int(resume_state["global_step"])
+    epoch = int(resume_state["epoch"])
+    resume_step = int(resume_state["step_in_epoch"])
     while global_step < args.max_train_steps:
         dataloader.sampler.set_epoch(epoch) if hasattr(dataloader.sampler, "set_epoch") else None
-        for batch in dataloader:
+        for step, batch in enumerate(dataloader):
+            if epoch == int(resume_state["epoch"]) and step < resume_step:
+                continue
             with accelerator.accumulate(transformer):
                 with torch.no_grad():
                     target = batch["target"].to(accelerator.device, dtype=weight_dtype)
@@ -341,19 +343,23 @@ def main():
                 global_step += 1
                 if accelerator.is_main_process and global_step % 10 == 0:
                     print(f"step={global_step} loss={loss.detach().item():.6f}")
-                if global_step % args.save_steps == 0:
+                if global_step % args.save_steps == 0 or global_step == args.max_train_steps:
                     save_lora(
                         accelerator,
                         transformer,
+                        optimizer,
                         output_dir / f"checkpoint-{global_step}",
                         args,
                         global_step,
+                        epoch,
+                        step + 1,
                     )
                 if global_step >= args.max_train_steps:
                     break
         epoch += 1
+        resume_step = 0
 
-    save_lora(accelerator, transformer, output_dir, args, global_step)
+    save_lora(accelerator, transformer, optimizer, output_dir, args, global_step, epoch, 0)
     accelerator.wait_for_everyone()
 
 

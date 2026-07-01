@@ -4,6 +4,7 @@ set -euo pipefail
 SCRIPT_DIR=$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd)
 
 MODE=${MODE:-all} # train | infer | batch | all
+# 第一阶段仅用于 E1/E2/E3。E1/E2 使用 ab，E3 使用 ab_focus。
 MODEL=${MODEL:-Efficient-Large-Model/Sana_Sprint_0.6B_1024px_diffusers}
 DATASET_BASE_PATH=${DATASET_BASE_PATH:-data}
 METADATA=${METADATA:-${DATASET_BASE_PATH}/metadata.json}
@@ -18,7 +19,23 @@ INFER_STEPS=${INFER_STEPS:-1}
 MIXED_PRECISION=${MIXED_PRECISION:-bf16}
 USE_FOCUS_MAPS=${USE_FOCUS_MAPS:-0}
 FOCUS_LOSS_WEIGHT=${FOCUS_LOSS_WEIGHT:-0.0}
+ADAPTER_TYPE=${ADAPTER_TYPE:-ab}
+FOCUS_A=${FOCUS_A:-${DATASET_BASE_PATH}/focus_a.png}
+FOCUS_B=${FOCUS_B:-${DATASET_BASE_PATH}/focus_b.png}
 SEED=${SEED:-0}
+CACHE_DIR=${CACHE_DIR:-}
+REVISION=${REVISION:-}
+LOCAL_FILES_ONLY=${LOCAL_FILES_ONLY:-0}
+RESUME_FROM_CHECKPOINT=${RESUME_FROM_CHECKPOINT:-}
+
+pretrained_args=()
+if [[ "${LOCAL_FILES_ONLY}" == "1" ]]; then pretrained_args+=(--local_files_only); fi
+if [[ -n "${CACHE_DIR}" ]]; then pretrained_args+=(--cache_dir "${CACHE_DIR}"); fi
+if [[ -n "${REVISION}" ]]; then pretrained_args+=(--revision "${REVISION}"); fi
+resume_args=()
+if [[ -n "${RESUME_FROM_CHECKPOINT}" ]]; then
+  resume_args+=(--resume_from_checkpoint "${RESUME_FROM_CHECKPOINT}")
+fi
 
 run_train() {
   local focus_args=()
@@ -33,12 +50,19 @@ run_train() {
     --resolution "${RESOLUTION}" \
     --batch_size "${BATCH_SIZE}" \
     --gradient_accumulation_steps "${GRAD_ACCUM_STEPS}" \
+    --adapter_type "${ADAPTER_TYPE}" \
     --max_train_steps "${MAX_TRAIN_STEPS}" \
     --mixed_precision "${MIXED_PRECISION}" \
-    "${focus_args[@]}"
+    "${focus_args[@]}" \
+    "${resume_args[@]}" \
+    "${pretrained_args[@]}"
 }
 
 run_infer() {
+  local focus_args=()
+  if [[ "${ADAPTER_TYPE}" == "ab_focus" ]]; then
+    focus_args+=(--focus_a "${FOCUS_A}" --focus_b "${FOCUS_B}")
+  fi
   python "${SCRIPT_DIR}/infer_sana_sprint.py" \
     --model "${MODEL}" \
     --adapter "${OUTPUT_DIR}/adapter.safetensors" \
@@ -48,7 +72,9 @@ run_infer() {
     --height "${RESOLUTION}" \
     --width "${RESOLUTION}" \
     --steps "${INFER_STEPS}" \
-    --seed "${SEED}"
+    --seed "${SEED}" \
+    "${focus_args[@]}" \
+    "${pretrained_args[@]}"
 }
 
 run_batch() {
@@ -63,7 +89,8 @@ run_batch() {
     --width "${RESOLUTION}" \
     --batch_size "${BATCH_SIZE}" \
     --steps "${INFER_STEPS}" \
-    --seed "${SEED}"
+    --seed "${SEED}" \
+    "${pretrained_args[@]}"
 }
 
 case "${MODE}" in

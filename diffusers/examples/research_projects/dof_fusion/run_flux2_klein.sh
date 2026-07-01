@@ -4,6 +4,7 @@ set -euo pipefail
 SCRIPT_DIR=$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd)
 
 MODE=${MODE:-all} # train | infer | batch | all
+# 非第一阶段方案：当前先完成 E1-E4 工程闭环。
 MODEL=${MODEL:-black-forest-labs/FLUX.2-klein-4B}
 DATASET_BASE_PATH=${DATASET_BASE_PATH:-data}
 METADATA=${METADATA:-${DATASET_BASE_PATH}/metadata.json}

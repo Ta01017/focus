@@ -10,6 +10,7 @@ from safetensors.torch import load_file
 
 from diffusers import SanaControlNetModel, SanaSprintPipeline
 
+from dof_utils import add_metadata_args, add_pretrained_args, pretrained_kwargs
 from infer_sana_sprint_controlnet import load_focus_map
 from metadata import load_metadata, require_keys, resolve_data_path
 from sana_dof import DualImageConditionAdapter, encode_condition_images
@@ -41,6 +42,8 @@ def parse_args():
     parser.add_argument("--max_samples", type=int, default=None)
     parser.add_argument("--skip_existing", action="store_true")
     parser.add_argument("--continue_on_error", action="store_true")
+    add_metadata_args(parser, metadata_required=True)
+    add_pretrained_args(parser)
     return parser.parse_args()
 
 
@@ -67,9 +70,13 @@ def main():
         config.get("conditioning_scale", 1.0) if args.conditioning_scale is None else args.conditioning_scale
     )
     dtype = torch.bfloat16 if torch.cuda.is_bf16_supported() else torch.float16
-    pipe = SanaSprintPipeline.from_pretrained(model_id, torch_dtype=dtype).to("cuda")
+    pipe = SanaSprintPipeline.from_pretrained(
+        model_id, torch_dtype=dtype, **pretrained_kwargs(args)
+    ).to("cuda")
     pipe.vae.to(dtype=torch.float32)
-    controlnet = SanaControlNetModel.from_pretrained(checkpoint / "controlnet", torch_dtype=dtype).to("cuda")
+    controlnet = SanaControlNetModel.from_pretrained(
+        checkpoint / "controlnet", torch_dtype=dtype, **pretrained_kwargs(args)
+    ).to("cuda")
     adapter = DualImageConditionAdapter(pipe.transformer.config.in_channels, config["hidden_channels"])
     adapter.load_state_dict(load_file(checkpoint / "adapter.safetensors"), strict=True)
     adapter.to(device="cuda", dtype=dtype).eval()

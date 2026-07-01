@@ -4,6 +4,7 @@ set -euo pipefail
 SCRIPT_DIR=$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd)
 
 MODE=${MODE:-all} # train | infer | batch | all
+# 非第一阶段方案：完成 E1-E4 前不要与第一阶段并行启动。
 MODEL=${MODEL:-Efficient-Large-Model/Sana_600M_1024px_diffusers}
 DATASET_BASE_PATH=${DATASET_BASE_PATH:-data}
 METADATA=${METADATA:-${DATASET_BASE_PATH}/metadata.json}

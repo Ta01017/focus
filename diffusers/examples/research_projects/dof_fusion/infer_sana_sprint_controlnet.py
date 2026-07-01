@@ -11,6 +11,7 @@ from safetensors.torch import load_file
 
 from diffusers import SanaControlNetModel, SanaSprintPipeline
 
+from dof_utils import add_metadata_args, add_pretrained_args, pretrained_kwargs
 from sana_dof import DualImageConditionAdapter, encode_condition_images
 from sana_sprint_controlnet import SanaSprintFocusControlNetTransformer
 
@@ -30,6 +31,8 @@ def parse_args():
     parser.add_argument("--guidance_scale", type=float, default=4.5)
     parser.add_argument("--conditioning_scale", type=float, default=None)
     parser.add_argument("--seed", type=int, default=0)
+    add_metadata_args(parser)
+    add_pretrained_args(parser)
     return parser.parse_args()
 
 
@@ -54,10 +57,14 @@ def main():
         config.get("conditioning_scale", 1.0) if args.conditioning_scale is None else args.conditioning_scale
     )
     dtype = torch.bfloat16 if torch.cuda.is_bf16_supported() else torch.float16
-    pipe = SanaSprintPipeline.from_pretrained(model_id, torch_dtype=dtype).to("cuda")
+    pipe = SanaSprintPipeline.from_pretrained(
+        model_id, torch_dtype=dtype, **pretrained_kwargs(args)
+    ).to("cuda")
     pipe.vae.to(dtype=torch.float32)
 
-    controlnet = SanaControlNetModel.from_pretrained(checkpoint / "controlnet", torch_dtype=dtype).to("cuda")
+    controlnet = SanaControlNetModel.from_pretrained(
+        checkpoint / "controlnet", torch_dtype=dtype, **pretrained_kwargs(args)
+    ).to("cuda")
     adapter = DualImageConditionAdapter(
         latent_channels=pipe.transformer.config.in_channels,
         hidden_channels=config["hidden_channels"],
@@ -102,4 +109,3 @@ def main():
 
 if __name__ == "__main__":
     main()
-

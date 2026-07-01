@@ -18,8 +18,21 @@ class DiffSynthFocusDataset(Dataset):
         min_edit_images: int,
         use_focus_maps: bool,
         default_prompt: str,
+        prompt_key: str = "prompt",
+        start_index: int = 0,
+        max_samples: int | None = None,
     ):
-        self.samples = load_metadata(metadata_path)
+        if repeat < 1:
+            raise ValueError("dataset_repeat must be at least 1.")
+        if start_index < 0:
+            raise ValueError("start_index must be non-negative.")
+        if max_samples is not None and max_samples < 1:
+            raise ValueError("max_samples must be positive when provided.")
+        samples = load_metadata(metadata_path)
+        end = None if max_samples is None else start_index + max_samples
+        self.samples = samples[start_index:end]
+        if not self.samples:
+            raise ValueError("Dataset selection is empty.")
         self.root = Path(base_path)
         self.target_key = target_key
         self.edit_key = edit_key
@@ -27,6 +40,7 @@ class DiffSynthFocusDataset(Dataset):
         self.min_edit_images = min_edit_images
         self.use_focus_maps = use_focus_maps
         self.default_prompt = default_prompt
+        self.prompt_key = prompt_key
         for index, sample in enumerate(self.samples):
             require_keys(sample, (target_key, edit_key), index)
             edit_images = sample[edit_key]
@@ -56,7 +70,7 @@ class DiffSynthFocusDataset(Dataset):
                 f"Sample {sample_index} contains different image sizes before resize: {sizes}.",
                 stacklevel=2,
             )
-        prompt = sample.get("prompt") or self.default_prompt
+        prompt = sample.get(self.prompt_key) or self.default_prompt
         if not isinstance(prompt, str):
             raise ValueError(f"Metadata sample {sample_index} prompt must be a string.")
         return {
@@ -65,4 +79,3 @@ class DiffSynthFocusDataset(Dataset):
             "prompt": prompt,
             "path_info": {"target": sample[self.target_key], "edit_images": edit_paths},
         }
-

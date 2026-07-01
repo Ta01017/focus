@@ -145,7 +145,46 @@ bash examples/research_projects/dof_fusion/run_sana_sprint.sh
 
 ## 推荐实验顺序
 
-建议不要一开始同时验证多图注入、focus map 和 ControlNet。推荐顺序如下：
+### 第一阶段只运行 E1～E4
+
+当前工程阶段不要启动普通/Sprint ControlNet、FLUX.2 LoRA 或 FLUX.2 control branch。第一阶段固定为：
+
+| 实验 | 配置 | 目的 |
+| --- | --- | --- |
+| E1 | SANA-Sprint A/B Adapter，不使用 focus loss | 建立最小双图融合基线 |
+| E2 | SANA-Sprint A/B Adapter + focus loss | 验证区域加权监督 |
+| E3 | SANA-Sprint A/B+focus Adapter + focus loss | 验证 focus 直接进入网络 |
+| E4 | SANA-Sprint img2img，A 初始化 | 验证结构和纹理保持能力 |
+
+```bash
+# E1
+MODE=all ADAPTER_TYPE=ab USE_FOCUS_MAPS=0 FOCUS_LOSS_WEIGHT=0 \
+OUTPUT_DIR=outputs/dof_fusion/e1_ab_no_focus \
+bash examples/research_projects/dof_fusion/run_sana_sprint.sh
+
+# E2
+MODE=all ADAPTER_TYPE=ab USE_FOCUS_MAPS=1 FOCUS_LOSS_WEIGHT=1.0 \
+OUTPUT_DIR=outputs/dof_fusion/e2_ab_focus_loss \
+bash examples/research_projects/dof_fusion/run_sana_sprint.sh
+
+# E3
+MODE=all ADAPTER_TYPE=ab_focus USE_FOCUS_MAPS=1 FOCUS_LOSS_WEIGHT=1.0 \
+FOCUS_A=/data/dof/focus_a.png FOCUS_B=/data/dof/focus_b.png \
+OUTPUT_DIR=outputs/dof_fusion/e3_ab_focus_adapter \
+bash examples/research_projects/dof_fusion/run_sana_sprint.sh
+
+# E4
+MODE=all INFER_STEPS=4 STRENGTH=0.75 \
+OUTPUT_DIR=outputs/dof_fusion/e4_img2img \
+bash examples/research_projects/dof_fusion/run_sana_sprint_img2img.sh
+```
+
+E1～E4 完成并形成可比较结果后，再决定是否运行 ControlNet 和 FLUX.2 路线。不要同时启动多个重模型
+实验，以免把数据、显存和实现问题混在一起。
+
+### 后续候选顺序
+
+建议不要一开始同时验证多图注入、focus map 和 ControlNet。后续顺序如下：
 
 1. **SANA-Sprint A/B Adapter**：最符合小模型、one-step 和后续端侧部署目标。
 2. **FLUX.2 Klein LoRA**：作为原生多图条件下的质量上限和数据有效性基准。
@@ -154,7 +193,65 @@ bash examples/research_projects/dof_fusion/run_sana_sprint.sh
 5. **SANA-Sprint + ControlNet**：普通 ControlNet 有收益后，再尝试迁移到 one-step。
 6. **FLUX.2 Klein + 轻量 ControlNet**：自定义研究路线，建议最后验证。
 
-第一轮建议只使用 `[A, B] → GT`，暂时不开 focus loss。
+E1 只使用 `[A, B] → GT` 且不开 focus loss；E2/E3 再逐项引入 focus，避免一次改变多个变量。
+
+## 数据检查、smoke test 与评测
+
+训练前检查 metadata、图片路径、尺寸和 focus map 值域，并生成 preview grid：
+
+```bash
+python examples/research_projects/dof_fusion/check_dof_metadata.py \
+  --dataset_metadata_path /data/dof/metadata.json \
+  --dataset_base_path /data/dof \
+  --continue_on_error \
+  --preview_output outputs/metadata_preview.jpg \
+  --report_output outputs/metadata_report.json
+```
+
+一次运行 E1～E4 的工程 smoke test。每个实验训练 2 steps，然后执行一次单张推理和一次单样本 batch
+推理，任何命令失败都会立即 `exit 1`：
+
+```bash
+DATASET_BASE_PATH=/data/dof \
+METADATA=/data/dof/metadata.json \
+IMAGE_A=/data/dof/a.png \
+IMAGE_B=/data/dof/b.png \
+FOCUS_A=/data/dof/focus_a.png \
+FOCUS_B=/data/dof/focus_b.png \
+bash examples/research_projects/dof_fusion/smoke_test_all.sh
+```
+
+评测生成结果：
+
+```bash
+python examples/research_projects/dof_fusion/eval_dof_results.py \
+  --dataset_metadata_path outputs/sana/batch/metadata_results.json \
+  --dataset_base_path /data/dof \
+  --output_json outputs/sana/eval.json \
+  --output_csv outputs/sana/eval.csv
+```
+
+评测项包括全图、keep 区域和 blur 区域的 PSNR、SSIM、L1，以及 Sobel edge L1。`focus_a` 白色表示
+保留 A 的清晰区域，黑色表示需要从 B 恢复。
+
+## 断点恢复与离线加载
+
+所有训练脚本支持：
+
+```bash
+--resume_from_checkpoint latest
+```
+
+训练会保存 `checkpoint-N`，其中包含模型增量权重、`optimizer.pt` 和 `trainer_state.json`。也可以传入
+指定的 `checkpoint-N` 路径。
+
+所有训练、单图推理和 batch 推理入口均支持：
+
+```text
+--local_files_only
+--cache_dir /path/to/huggingface/cache
+--revision main
+```
 
 ## DiffSynth-Studio metadata 格式
 
@@ -201,6 +298,18 @@ edit_image[3] = focus_b 或 focus_b_warp（可选）
 
 所有图像允许在 resize 前具有不同尺寸，训练时统一 resize 到 `--resolution`。但是 A、B 和 GT 应尽量
 完成几何配准，并使用相同的裁剪、缩放和数据增强。
+
+所有训练、单图推理和批量推理入口统一接受以下 metadata 参数（单图入口可只传 `--image_a`、
+`--image_b`，这些 metadata 参数用于保持自动化调用接口一致）：
+
+```text
+--dataset_metadata_path  --dataset_base_path
+--target_key image       --edit_key edit_image
+--prompt_key prompt      --id_key id
+--seed_key seed          --result_key generated_image
+--start_index            --max_samples
+--skip_existing          --continue_on_error
+```
 
 ## 一键运行脚本
 
@@ -281,8 +390,9 @@ python examples/research_projects/dof_fusion/infer_sana_sprint.py \
   --steps 1
 ```
 
-focus map 在该方案中保持 `[0, 1]`，不经过 VAE；当前仅用于可选 focus-aware loss，尚未直接进入
-Adapter。
+focus map 始终保持 `[0, 1]` 且不经过 VAE。`--adapter_type ab` 时它只用于可选 focus-aware loss；
+`--adapter_type ab_focus` 时，Adapter 输入为 `[A_latent, B_latent, focus_a, focus_b]`，推理会根据
+`adapter_config.json` 自动创建对应 Adapter。
 
 ## 方案二：FLUX.2 Klein LoRA
 

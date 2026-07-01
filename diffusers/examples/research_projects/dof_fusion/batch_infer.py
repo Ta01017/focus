@@ -10,9 +10,11 @@ from safetensors.torch import load_file
 
 from diffusers import Flux2KleinPipeline, SanaSprintPipeline
 
+from dof_utils import add_metadata_args, add_pretrained_args, pretrained_kwargs
 from infer_flux2_klein import DEFAULT_PROMPT
+from infer_sana_sprint import load_focus
 from metadata import load_metadata, require_keys, resolve_data_path
-from sana_dof import ConditionedSanaTransformer, DualImageConditionAdapter, encode_condition_images
+from sana_dof import ConditionedSanaTransformer, create_condition_adapter, encode_condition_images
 
 
 def parse_args():
@@ -42,6 +44,8 @@ def parse_args():
     parser.add_argument("--lora", default=None, help="Optional FLUX.2 Klein LoRA directory or weight file.")
     parser.add_argument("--adapter", default=None, help="Required for the SANA backend.")
     parser.add_argument("--adapter_hidden_channels", type=int, default=None)
+    add_metadata_args(parser)
+    add_pretrained_args(parser)
     return parser.parse_args()
 
 
@@ -84,7 +88,7 @@ def run_flux2(items: list[tuple[int, dict]], args) -> list[dict]:
     steps = args.steps or 4
     guidance_scale = 1.0 if args.guidance_scale is None else args.guidance_scale
     dtype = torch.bfloat16 if torch.cuda.is_available() and torch.cuda.is_bf16_supported() else torch.float16
-    pipe = Flux2KleinPipeline.from_pretrained(model, torch_dtype=dtype)
+    pipe = Flux2KleinPipeline.from_pretrained(model, torch_dtype=dtype, **pretrained_kwargs(args))
     if args.lora is not None:
         pipe.load_lora_weights(args.lora)
     if args.cpu_offload:
@@ -145,11 +149,12 @@ def run_sana(items: list[tuple[int, dict]], args) -> list[dict]:
     steps = args.steps or 1
     guidance_scale = 4.5 if args.guidance_scale is None else args.guidance_scale
     dtype = torch.bfloat16 if torch.cuda.is_bf16_supported() else torch.float16
-    pipe = SanaSprintPipeline.from_pretrained(model, torch_dtype=dtype).to("cuda")
+    pipe = SanaSprintPipeline.from_pretrained(model, torch_dtype=dtype, **pretrained_kwargs(args)).to("cuda")
     pipe.vae.to(dtype=torch.float32)
 
     hidden_channels = args.adapter_hidden_channels or adapter_config.get("hidden_channels", 128)
-    adapter = DualImageConditionAdapter(pipe.transformer.config.in_channels, hidden_channels)
+    adapter_type = adapter_config.get("adapter_type", "ab")
+    adapter = create_condition_adapter(adapter_type, pipe.transformer.config.in_channels, hidden_channels)
     adapter.load_state_dict(load_file(args.adapter), strict=True)
     adapter.to(device="cuda", dtype=dtype).eval()
     conditioned_transformer = ConditionedSanaTransformer(pipe.transformer, adapter)
@@ -183,7 +188,28 @@ def run_sana(items: list[tuple[int, dict]], args) -> list[dict]:
             cond_a_latents, cond_b_latents = encode_condition_images(
                 pipe, images_a, images_b, args.height, args.width, torch.device("cuda")
             )
-            with conditioned_transformer.use_condition(cond_a_latents, cond_b_latents):
+            focus_a = None
+            focus_b = None
+            if adapter_type == "ab_focus":
+                focus_a_items = []
+                focus_b_items = []
+                for index, record, _, _ in chunk:
+                    edits = record[args.edit_key]
+                    if len(edits) < 4:
+                        raise ValueError(f"Sample {index} requires edit_image[A,B,focus_a,focus_b].")
+                    focus_a_items.append(
+                        load_focus(
+                            resolve_data_path(edits[2], args.dataset_base_path), args.height, args.width
+                        )
+                    )
+                    focus_b_items.append(
+                        load_focus(
+                            resolve_data_path(edits[3], args.dataset_base_path), args.height, args.width
+                        )
+                    )
+                focus_a = torch.cat(focus_a_items).to("cuda")
+                focus_b = torch.cat(focus_b_items).to("cuda")
+            with conditioned_transformer.use_condition(cond_a_latents, cond_b_latents, focus_a, focus_b):
                 images = pipe(
                     prompt=prompts,
                     height=args.height,

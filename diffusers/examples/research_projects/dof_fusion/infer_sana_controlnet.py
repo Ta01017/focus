@@ -10,6 +10,7 @@ from safetensors.torch import load_file
 
 from diffusers import SanaControlNetModel, SanaControlNetPipeline
 
+from dof_utils import add_metadata_args, add_pretrained_args, pretrained_kwargs
 from sana_controlnet_dof import SanaControlNetInferenceTransformer
 from sana_dof import DualImageConditionAdapter, encode_condition_images
 
@@ -30,16 +31,20 @@ def parse_args():
     parser.add_argument("--guidance_scale", type=float, default=4.5)
     parser.add_argument("--conditioning_scale", type=float, default=None)
     parser.add_argument("--seed", type=int, default=0)
+    add_metadata_args(parser)
+    add_pretrained_args(parser)
     return parser.parse_args()
 
 
-def load_pipeline(checkpoint, model_id, dtype, conditioning_scale):
+def load_pipeline(checkpoint, model_id, dtype, conditioning_scale, pretrained_options):
     config = json.loads((checkpoint / "controlnet_config.json").read_text(encoding="utf-8"))
     model_id = model_id or config["base_model"]
     scale = config.get("conditioning_scale", 1.0) if conditioning_scale is None else conditioning_scale
-    controlnet = SanaControlNetModel.from_pretrained(checkpoint / "controlnet", torch_dtype=dtype)
+    controlnet = SanaControlNetModel.from_pretrained(
+        checkpoint / "controlnet", torch_dtype=dtype, **pretrained_options
+    )
     pipe = SanaControlNetPipeline.from_pretrained(
-        model_id, controlnet=controlnet, torch_dtype=dtype
+        model_id, controlnet=controlnet, torch_dtype=dtype, **pretrained_options
     ).to("cuda")
     pipe.vae.to(dtype=torch.float32)
     adapter = DualImageConditionAdapter(pipe.transformer.config.in_channels, config["hidden_channels"])
@@ -58,7 +63,7 @@ def main():
         raise ValueError("--height and --width must be divisible by 32.")
     dtype = torch.bfloat16 if torch.cuda.is_bf16_supported() else torch.float16
     pipe, transformer, scale, _ = load_pipeline(
-        Path(args.checkpoint), args.model, dtype, args.conditioning_scale
+        Path(args.checkpoint), args.model, dtype, args.conditioning_scale, pretrained_kwargs(args)
     )
     image_a = Image.open(args.image_a).convert("RGB")
     image_b = Image.open(args.image_b).convert("RGB")
