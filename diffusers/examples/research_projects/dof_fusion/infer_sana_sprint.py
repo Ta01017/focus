@@ -11,7 +11,13 @@ from safetensors.torch import load_file
 
 from diffusers import SanaSprintPipeline
 
-from dof_utils import add_metadata_args, add_pretrained_args, pretrained_kwargs
+from dof_utils import (
+    add_metadata_args,
+    add_pretrained_args,
+    prepare_dynamic_images,
+    pretrained_kwargs,
+    restore_output_size,
+)
 from sana_dof import ConditionedSanaTransformer, create_condition_adapter, encode_condition_images
 
 
@@ -25,8 +31,11 @@ def parse_args():
     parser.add_argument("--focus_b", default=None)
     parser.add_argument("--output", required=True)
     parser.add_argument("--prompt", default="a photorealistic all-in-focus photograph")
-    parser.add_argument("--height", type=int, default=1024)
-    parser.add_argument("--width", type=int, default=1024)
+    parser.add_argument("--height", type=int, default=None, help="Compatibility check only; must equal A height.")
+    parser.add_argument("--width", type=int, default=None, help="Compatibility check only; must equal A width.")
+    parser.add_argument("--max_pixels", type=int, default=None, help="Safety limit; never triggers resizing.")
+    parser.add_argument("--size_divisor", type=int, default=32)
+    parser.add_argument("--aspect_ratio_tolerance", type=float, default=0.01)
     parser.add_argument("--steps", type=int, choices=(1, 2, 3, 4), default=1)
     parser.add_argument("--guidance_scale", type=float, default=4.5)
     parser.add_argument("--seed", type=int, default=0)
@@ -36,8 +45,11 @@ def parse_args():
     return parser.parse_args()
 
 
-def load_focus(path, height, width):
-    image = Image.open(path).convert("L").resize((width, height), Image.Resampling.BILINEAR)
+def load_focus(source, height=None, width=None):
+    image = source if isinstance(source, Image.Image) else Image.open(source)
+    image = image.convert("L")
+    if height is not None and width is not None and image.size != (width, height):
+        image = image.resize((width, height), Image.Resampling.BILINEAR)
     return torch.from_numpy(np.asarray(image, dtype=np.float32) / 255.0).unsqueeze(0).unsqueeze(0)
 
 
@@ -66,33 +78,44 @@ def main():
     args = parse_args()
     if not torch.cuda.is_available():
         raise RuntimeError("该推理脚本需要 CUDA。")
-    if args.height % 32 or args.width % 32:
-        raise ValueError("--height 和 --width 必须能被 32 整除。")
     pipe, transformer, config = load_sana_adapter_pipeline(args)
     image_a = Image.open(args.image_a).convert("RGB")
     image_b = Image.open(args.image_b).convert("RGB")
+    if (args.height is None) != (args.width is None):
+        raise ValueError("--height 和 --width 必须同时提供或同时省略。")
+    if args.height is not None and image_a.size != (args.width, args.height):
+        raise ValueError("显式 --height/--width 必须与 A 原始尺寸一致；脚本不会拉伸 A。")
+    named_images = {"a": image_a, "b": image_b}
+    if config.get("adapter_type", "ab") == "ab_focus":
+        if args.focus_a is None or args.focus_b is None:
+            raise ValueError("ab_focus adapter 推理必须提供 --focus_a 和 --focus_b。")
+        named_images["focus_a"] = Image.open(args.focus_a)
+        named_images["focus_b"] = Image.open(args.focus_b)
+    prepared, size_info = prepare_dynamic_images(
+        named_images, args.max_pixels, args.size_divisor, args.aspect_ratio_tolerance
+    )
+    canvas_width, canvas_height = size_info["canvas_size"]
     cond_a, cond_b = encode_condition_images(
-        pipe, image_a, image_b, args.height, args.width, torch.device("cuda")
+        pipe, prepared["a"], prepared["b"], canvas_height, canvas_width, torch.device("cuda")
     )
     focus_a = None
     focus_b = None
     if config.get("adapter_type", "ab") == "ab_focus":
-        if args.focus_a is None or args.focus_b is None:
-            raise ValueError("ab_focus adapter 推理必须提供 --focus_a 和 --focus_b。")
-        focus_a = load_focus(args.focus_a, args.height, args.width).to("cuda")
-        focus_b = load_focus(args.focus_b, args.height, args.width).to("cuda")
+        focus_a = load_focus(prepared["focus_a"]).to("cuda")
+        focus_b = load_focus(prepared["focus_b"]).to("cuda")
     generator = torch.Generator(device="cuda").manual_seed(args.seed)
     with transformer.use_condition(cond_a, cond_b, focus_a, focus_b):
         image = pipe(
             prompt=args.prompt,
-            height=args.height,
-            width=args.width,
+            height=canvas_height,
+            width=canvas_width,
             num_inference_steps=args.steps,
             intermediate_timesteps=1.3 if args.steps == 2 else None,
             guidance_scale=args.guidance_scale,
             generator=generator,
             use_resolution_binning=False,
         ).images[0]
+    image = restore_output_size(image, size_info)
     output = Path(args.output)
     output.parent.mkdir(parents=True, exist_ok=True)
     image.save(output)

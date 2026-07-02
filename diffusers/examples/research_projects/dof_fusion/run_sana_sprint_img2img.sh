@@ -3,7 +3,7 @@ set -euo pipefail
 
 SCRIPT_DIR=$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd)
 
-MODE=${MODE:-all} # train | infer | batch | all
+MODE=${MODE:-train} # train | infer | batch | all
 # 第一阶段 E4：SANA-Sprint img2img，默认从 A 初始化。
 MODEL=${MODEL:-Efficient-Large-Model/Sana_Sprint_0.6B_1024px_diffusers}
 DATASET_BASE_PATH=${DATASET_BASE_PATH:-data}
@@ -12,7 +12,8 @@ OUTPUT_DIR=${OUTPUT_DIR:-outputs/dof_fusion/sana_sprint_img2img}
 IMAGE_A=${IMAGE_A:-${DATASET_BASE_PATH}/a.png}
 IMAGE_B=${IMAGE_B:-${DATASET_BASE_PATH}/b.png}
 INIT_IMAGE=${INIT_IMAGE:-${IMAGE_A}}
-RESOLUTION=${RESOLUTION:-1024}
+MAX_PIXELS=${MAX_PIXELS:-}
+SIZE_DIVISOR=${SIZE_DIVISOR:-32}
 BATCH_SIZE=${BATCH_SIZE:-1}
 GRAD_ACCUM_STEPS=${GRAD_ACCUM_STEPS:-4}
 MAX_TRAIN_STEPS=${MAX_TRAIN_STEPS:-20000}
@@ -35,6 +36,8 @@ resume_args=()
 if [[ -n "${RESUME_FROM_CHECKPOINT}" ]]; then
   resume_args+=(--resume_from_checkpoint "${RESUME_FROM_CHECKPOINT}")
 fi
+size_args=(--size_divisor "${SIZE_DIVISOR}")
+if [[ -n "${MAX_PIXELS}" ]]; then size_args+=(--max_pixels "${MAX_PIXELS}"); fi
 
 run_train() {
   local focus_args=()
@@ -46,13 +49,13 @@ run_train() {
     --dataset_metadata_path "${METADATA}" \
     --dataset_base_path "${DATASET_BASE_PATH}" \
     --output_dir "${OUTPUT_DIR}" \
-    --resolution "${RESOLUTION}" \
     --batch_size "${BATCH_SIZE}" \
     --gradient_accumulation_steps "${GRAD_ACCUM_STEPS}" \
     --max_train_steps "${MAX_TRAIN_STEPS}" \
     --mixed_precision "${MIXED_PRECISION}" \
     "${focus_args[@]}" \
     "${resume_args[@]}" \
+    "${size_args[@]}" \
     "${pretrained_args[@]}"
 }
 
@@ -64,11 +67,10 @@ run_infer() {
     --image_b "${IMAGE_B}" \
     --init_image "${INIT_IMAGE}" \
     --output "${OUTPUT_DIR}/single_result.png" \
-    --height "${RESOLUTION}" \
-    --width "${RESOLUTION}" \
     --steps "${INFER_STEPS}" \
     --strength "${STRENGTH}" \
     --seed "${SEED}" \
+    "${size_args[@]}" \
     "${pretrained_args[@]}"
 }
 
@@ -79,12 +81,11 @@ run_batch() {
     --dataset_metadata_path "${METADATA}" \
     --dataset_base_path "${DATASET_BASE_PATH}" \
     --output_dir "${OUTPUT_DIR}/batch" \
-    --height "${RESOLUTION}" \
-    --width "${RESOLUTION}" \
     --batch_size "${BATCH_SIZE}" \
     --steps "${INFER_STEPS}" \
     --strength "${STRENGTH}" \
     --seed "${SEED}" \
+    "${size_args[@]}" \
     "${pretrained_args[@]}"
 }
 

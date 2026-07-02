@@ -39,7 +39,10 @@ def parse_args():
     parser.add_argument("--adapter_type", choices=("ab", "ab_focus"), default="ab")
     parser.add_argument("--output_dir", required=True)
     parser.add_argument("--prompt", default="a photorealistic all-in-focus photograph")
-    parser.add_argument("--resolution", type=int, default=1024)
+    parser.add_argument("--resolution", type=int, default=None, help="Legacy fixed square size; omit for dynamic resolution.")
+    parser.add_argument("--max_pixels", type=int, default=None, help="Safety limit only; images are never downscaled.")
+    parser.add_argument("--size_divisor", type=int, default=32)
+    parser.add_argument("--aspect_ratio_tolerance", type=float, default=0.01)
     parser.add_argument("--batch_size", type=int, default=1)
     parser.add_argument("--gradient_accumulation_steps", type=int, default=1)
     parser.add_argument("--learning_rate", type=float, default=1e-4)
@@ -84,6 +87,9 @@ def save_checkpoint(accelerator, model, optimizer, directory, args, global_step,
         "latent_channels": unwrapped.config.in_channels,
         "hidden_channels": args.adapter_hidden_channels,
         "resolution": args.resolution,
+        "max_pixels": args.max_pixels,
+        "size_divisor": args.size_divisor,
+        "geometry_mode": "a_original_size_edge_pad_no_resize_no_crop",
         "min_timestep": args.min_timestep,
         "max_timestep": args.max_timestep,
         "global_step": global_step,
@@ -96,8 +102,10 @@ def save_checkpoint(accelerator, model, optimizer, directory, args, global_step,
 
 def main():
     args = parse_args()
-    if args.resolution % 32:
-        raise ValueError("--resolution must be divisible by 32.")
+    if args.resolution is not None:
+        raise ValueError("E4 disables fixed square --resolution; omit it and optionally set --max_pixels.")
+    if args.batch_size != 1:
+        raise ValueError("Dynamic-resolution training currently requires --batch_size 1; use gradient accumulation.")
     if not 0 <= args.min_timestep < args.max_timestep <= 1.57080:
         raise ValueError("Require 0 <= min_timestep < max_timestep <= 1.57080.")
     if not 0 <= args.max_timestep_probability <= 1:
@@ -156,7 +164,15 @@ def main():
     )
 
     def collate_fn(samples):
-        return paired_preprocess(samples, args.resolution, pipe.image_processor, training=True)
+        return paired_preprocess(
+            samples,
+            args.resolution,
+            pipe.image_processor,
+            training=True,
+            max_pixels=args.max_pixels,
+            size_divisor=args.size_divisor,
+            aspect_ratio_tolerance=args.aspect_ratio_tolerance,
+        )
 
     dataloader = DataLoader(
         dataset,
@@ -233,7 +249,14 @@ def main():
                     torch.cos(expanded) * noisy_state - torch.sin(expanded) * velocity
                 ) / sigma_data
                 error = predicted_target.float() - target.float()
-                loss = error.square().mean() + 0.1 * error.abs().mean()
+                valid_mask = F.interpolate(
+                    batch["valid_mask"].to(accelerator.device),
+                    size=error.shape[-2:],
+                    mode="nearest",
+                )
+                valid_denominator = (valid_mask.sum() * error.shape[1]).clamp_min(1)
+                loss = (error.square() * valid_mask).sum() / valid_denominator
+                loss = loss + 0.1 * (error.abs() * valid_mask).sum() / valid_denominator
                 if args.focus_loss_weight > 0 and batch["focus_a"] is not None:
                     focus = F.interpolate(
                         batch["focus_a"].to(accelerator.device),
@@ -242,7 +265,9 @@ def main():
                         align_corners=False,
                     ).pow(args.focus_mask_gamma)
                     weight = args.focus_keep_weight * focus + args.focus_blur_weight * (1 - focus)
-                    per_sample = (error.abs() * weight).mean(dim=(1, 2, 3))
+                    weighted = error.abs() * weight * valid_mask
+                    denominator = (valid_mask.sum(dim=(1, 2, 3)) * error.shape[1]).clamp_min(1)
+                    per_sample = weighted.sum(dim=(1, 2, 3)) / denominator
                     valid = batch["focus_a_valid"].to(accelerator.device)
                     loss = loss + args.focus_loss_weight * (per_sample * valid).sum() / valid.sum().clamp_min(1)
                 accelerator.backward(loss)

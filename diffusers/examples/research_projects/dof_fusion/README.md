@@ -296,8 +296,15 @@ edit_image[3] = focus_b 或 focus_b_warp（可选）
 ]
 ```
 
-所有图像允许在 resize 前具有不同尺寸，训练时统一 resize 到 `--resolution`。但是 A、B 和 GT 应尽量
-完成几何配准，并使用相同的裁剪、缩放和数据增强。
+E1～E4 默认以 A 的原始宽高为准，不把图像拉伸成正方形，也不缩放或裁掉 A 的有效内容：
+
+- A 只在右侧和底部使用 edge padding 补齐到 32 的倍数，模型输出后只移除这部分人工 padding。
+- B、GT、focus_a、focus_b 如果像素尺寸不同但宽高比与 A 一致，会对齐到 A 的宽高。
+- 宽高比误差超过 `--aspect_ratio_tolerance`（默认 1%）会报错，不会静默拉伸不匹配的数据。
+- `--max_pixels` 是可选的最大像素安全检查。小于上限时保持不变；超过上限时报错，不会自动缩小。
+- 动态原尺寸训练和 batch 推理当前要求 `--batch_size 1`，可用梯度累积增大有效 batch。
+
+例如 `A=1920x1080` 时，模型画布仅 padding 为 `1920x1088`，最后输出仍严格为 `1920x1080`。
 
 所有训练、单图推理和批量推理入口统一接受以下 metadata 参数（单图入口可只传 `--image_a`、
 `--image_b`，这些 metadata 参数用于保持自动化调用接口一致）：
@@ -329,7 +336,9 @@ edit_image[3] = focus_b 或 focus_b_warp（可选）
 - `MODE=train`：只训练。
 - `MODE=infer`：只执行单张推理。
 - `MODE=batch`：只执行 metadata 批量推理。
-- `MODE=all`：依次执行训练、单张推理和批量推理，默认值。
+- `MODE=all`：依次执行训练、单张推理和批量推理，用于手动闭环检查。
+
+第一阶段的 SANA-Sprint 脚本默认 `MODE=train`，避免一次正式训练结束后自动遍历整个数据集。
 
 示例：
 
@@ -373,9 +382,9 @@ accelerate launch examples/research_projects/dof_fusion/train_sana_sprint.py \
   --dataset_base_path data \
   --dataset_metadata_path data/metadata.json \
   --output_dir outputs/sana_dof_adapter \
-  --resolution 1024 \
   --batch_size 1 \
   --gradient_accumulation_steps 4 \
+  --max_pixels 2073600 \
   --max_train_steps 20000
 ```
 

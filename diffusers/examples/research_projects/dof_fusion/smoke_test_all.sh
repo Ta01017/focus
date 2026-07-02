@@ -10,7 +10,8 @@ IMAGE_B=${IMAGE_B:?请设置 IMAGE_B}
 FOCUS_A=${FOCUS_A:?请设置 FOCUS_A}
 FOCUS_B=${FOCUS_B:?请设置 FOCUS_B}
 OUTPUT_ROOT=${OUTPUT_ROOT:-outputs/dof_fusion/smoke}
-RESOLUTION=${RESOLUTION:-512}
+MAX_PIXELS=${MAX_PIXELS:-}
+SIZE_DIVISOR=${SIZE_DIVISOR:-32}
 CACHE_DIR=${CACHE_DIR:-}
 REVISION=${REVISION:-}
 LOCAL_FILES_ONLY=${LOCAL_FILES_ONLY:-0}
@@ -19,6 +20,8 @@ pretrained_args=()
 if [[ "${LOCAL_FILES_ONLY}" == "1" ]]; then
   pretrained_args+=(--local_files_only)
 fi
+size_args=(--size_divisor "${SIZE_DIVISOR}")
+if [[ -n "${MAX_PIXELS}" ]]; then size_args+=(--max_pixels "${MAX_PIXELS}"); fi
 if [[ -n "${CACHE_DIR}" ]]; then
   pretrained_args+=(--cache_dir "${CACHE_DIR}")
 fi
@@ -50,13 +53,13 @@ train_adapter() {
     --dataset_base_path "${DATASET_BASE_PATH}" \
     --output_dir "${output_dir}" \
     --adapter_type "${adapter_type}" \
-    --resolution "${RESOLUTION}" \
     --batch_size 1 \
     --num_workers 0 \
     --max_samples 1 \
     --max_train_steps 2 \
     --save_steps 1 \
     "${focus_args[@]}" \
+    "${size_args[@]}" \
     "${pretrained_args[@]}"
 
   local infer_focus_args=()
@@ -68,10 +71,9 @@ train_adapter() {
     --image_a "${IMAGE_A}" \
     --image_b "${IMAGE_B}" \
     --output "${output_dir}/single.png" \
-    --height "${RESOLUTION}" \
-    --width "${RESOLUTION}" \
     --steps 1 \
     "${infer_focus_args[@]}" \
+    "${size_args[@]}" \
     "${pretrained_args[@]}"
 
   python "${SCRIPT_DIR}/batch_infer.py" \
@@ -80,11 +82,10 @@ train_adapter() {
     --dataset_metadata_path "${METADATA}" \
     --dataset_base_path "${DATASET_BASE_PATH}" \
     --output_dir "${output_dir}/batch" \
-    --height "${RESOLUTION}" \
-    --width "${RESOLUTION}" \
     --batch_size 1 \
     --max_samples 1 \
     --steps 1 \
+    "${size_args[@]}" \
     "${pretrained_args[@]}"
 }
 
@@ -98,12 +99,12 @@ accelerate launch "${SCRIPT_DIR}/train_sana_sprint_img2img.py" \
   --dataset_metadata_path "${METADATA}" \
   --dataset_base_path "${DATASET_BASE_PATH}" \
   --output_dir "${E4_DIR}" \
-  --resolution "${RESOLUTION}" \
   --batch_size 1 \
   --num_workers 0 \
   --max_samples 1 \
   --max_train_steps 2 \
   --save_steps 1 \
+  "${size_args[@]}" \
   "${pretrained_args[@]}"
 
 python "${SCRIPT_DIR}/infer_sana_sprint_img2img.py" \
@@ -111,10 +112,9 @@ python "${SCRIPT_DIR}/infer_sana_sprint_img2img.py" \
   --image_a "${IMAGE_A}" \
   --image_b "${IMAGE_B}" \
   --output "${E4_DIR}/single.png" \
-  --height "${RESOLUTION}" \
-  --width "${RESOLUTION}" \
   --steps 4 \
   --strength 0.75 \
+  "${size_args[@]}" \
   "${pretrained_args[@]}"
 
 python "${SCRIPT_DIR}/batch_infer_sana_sprint_img2img.py" \
@@ -122,12 +122,11 @@ python "${SCRIPT_DIR}/batch_infer_sana_sprint_img2img.py" \
   --dataset_metadata_path "${METADATA}" \
   --dataset_base_path "${DATASET_BASE_PATH}" \
   --output_dir "${E4_DIR}/batch" \
-  --height "${RESOLUTION}" \
-  --width "${RESOLUTION}" \
   --batch_size 1 \
   --max_samples 1 \
   --steps 4 \
   --strength 0.75 \
+  "${size_args[@]}" \
   "${pretrained_args[@]}"
 
 echo "E1-E4 smoke tests passed."

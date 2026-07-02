@@ -10,7 +10,13 @@ from safetensors.torch import load_file
 
 from diffusers import Flux2KleinPipeline, SanaSprintPipeline
 
-from dof_utils import add_metadata_args, add_pretrained_args, pretrained_kwargs
+from dof_utils import (
+    add_metadata_args,
+    add_pretrained_args,
+    prepare_dynamic_images,
+    pretrained_kwargs,
+    restore_output_size,
+)
 from infer_flux2_klein import DEFAULT_PROMPT
 from infer_sana_sprint import load_focus
 from metadata import load_metadata, require_keys, resolve_data_path
@@ -29,8 +35,11 @@ def parse_args():
     parser.add_argument("--seed_key", default="seed")
     parser.add_argument("--result_key", default="generated_image")
     parser.add_argument("--prompt", default=None, help="Fallback prompt when a sample has no prompt field.")
-    parser.add_argument("--height", type=int, default=1024)
-    parser.add_argument("--width", type=int, default=1024)
+    parser.add_argument("--height", type=int, default=None, help="Compatibility check; must match every A image.")
+    parser.add_argument("--width", type=int, default=None, help="Compatibility check; must match every A image.")
+    parser.add_argument("--max_pixels", type=int, default=None, help="Safety limit; never triggers resizing.")
+    parser.add_argument("--size_divisor", type=int, default=32)
+    parser.add_argument("--aspect_ratio_tolerance", type=float, default=0.01)
     parser.add_argument("--steps", type=int, default=None)
     parser.add_argument("--guidance_scale", type=float, default=None)
     parser.add_argument("--seed", type=int, default=0)
@@ -113,17 +122,27 @@ def run_flux2(items: list[tuple[int, dict]], args) -> list[dict]:
             continue
         try:
             image_a, image_b = load_condition_pair(record, index, args)
+            if args.height is not None and image_a.size != (args.width, args.height):
+                raise ValueError(f"Sample {index} A size must equal explicit --width/--height.")
+            prepared, size_info = prepare_dynamic_images(
+                {"a": image_a, "b": image_b},
+                args.max_pixels,
+                args.size_divisor,
+                args.aspect_ratio_tolerance,
+            )
+            canvas_width, canvas_height = size_info["canvas_size"]
             seed = int(record.get(args.seed_key, args.seed + index))
             generator = torch.Generator(device=generator_device).manual_seed(seed)
             image = pipe(
-                image=[image_a, image_b],
+                image=[prepared["a"], prepared["b"]],
                 prompt=sample_prompt(record, args, DEFAULT_PROMPT),
-                height=args.height,
-                width=args.width,
+                height=canvas_height,
+                width=canvas_width,
                 num_inference_steps=steps,
                 guidance_scale=guidance_scale,
                 generator=generator,
             ).images[0]
+            image = restore_output_size(image, size_info)
             output.parent.mkdir(parents=True, exist_ok=True)
             image.save(output)
         except Exception as error:
@@ -177,6 +196,9 @@ def run_sana(items: list[tuple[int, dict]], args) -> list[dict]:
             pairs = [load_condition_pair(record, index, args) for index, record, _, _ in chunk]
             images_a = [pair[0] for pair in pairs]
             images_b = [pair[1] for pair in pairs]
+            if args.height is not None and images_a[0].size != (args.width, args.height):
+                raise ValueError(f"Sample {chunk[0][0]} A size must equal explicit --width/--height.")
+            named_images = {"a": images_a[0], "b": images_b[0]}
             prompts = [
                 sample_prompt(record, args, "a photorealistic all-in-focus photograph")
                 for _, record, _, _ in chunk
@@ -185,35 +207,30 @@ def run_sana(items: list[tuple[int, dict]], args) -> list[dict]:
                 torch.Generator(device="cuda").manual_seed(int(record.get(args.seed_key, args.seed + index)))
                 for index, record, _, _ in chunk
             ]
-            cond_a_latents, cond_b_latents = encode_condition_images(
-                pipe, images_a, images_b, args.height, args.width, torch.device("cuda")
-            )
             focus_a = None
             focus_b = None
             if adapter_type == "ab_focus":
-                focus_a_items = []
-                focus_b_items = []
-                for index, record, _, _ in chunk:
-                    edits = record[args.edit_key]
-                    if len(edits) < 4:
-                        raise ValueError(f"Sample {index} requires edit_image[A,B,focus_a,focus_b].")
-                    focus_a_items.append(
-                        load_focus(
-                            resolve_data_path(edits[2], args.dataset_base_path), args.height, args.width
-                        )
-                    )
-                    focus_b_items.append(
-                        load_focus(
-                            resolve_data_path(edits[3], args.dataset_base_path), args.height, args.width
-                        )
-                    )
-                focus_a = torch.cat(focus_a_items).to("cuda")
-                focus_b = torch.cat(focus_b_items).to("cuda")
+                index, record, _, _ = chunk[0]
+                edits = record[args.edit_key]
+                if len(edits) < 4:
+                    raise ValueError(f"Sample {index} requires edit_image[A,B,focus_a,focus_b].")
+                named_images["focus_a"] = Image.open(resolve_data_path(edits[2], args.dataset_base_path))
+                named_images["focus_b"] = Image.open(resolve_data_path(edits[3], args.dataset_base_path))
+            prepared, size_info = prepare_dynamic_images(
+                named_images, args.max_pixels, args.size_divisor, args.aspect_ratio_tolerance
+            )
+            canvas_width, canvas_height = size_info["canvas_size"]
+            cond_a_latents, cond_b_latents = encode_condition_images(
+                pipe, prepared["a"], prepared["b"], canvas_height, canvas_width, torch.device("cuda")
+            )
+            if adapter_type == "ab_focus":
+                focus_a = load_focus(prepared["focus_a"]).to("cuda")
+                focus_b = load_focus(prepared["focus_b"]).to("cuda")
             with conditioned_transformer.use_condition(cond_a_latents, cond_b_latents, focus_a, focus_b):
                 images = pipe(
                     prompt=prompts,
-                    height=args.height,
-                    width=args.width,
+                    height=canvas_height,
+                    width=canvas_width,
                     num_inference_steps=steps,
                     intermediate_timesteps=1.3 if steps == 2 else None,
                     guidance_scale=guidance_scale,
@@ -222,7 +239,7 @@ def run_sana(items: list[tuple[int, dict]], args) -> list[dict]:
                 ).images
             for image, (index, _, output, result) in zip(images, chunk):
                 output.parent.mkdir(parents=True, exist_ok=True)
-                image.save(output)
+                restore_output_size(image, size_info).save(output)
                 results.append(result)
                 print(f"[{index + 1}] {output}")
         except Exception as error:
@@ -238,8 +255,10 @@ def main():
     args = parse_args()
     if args.batch_size < 1:
         raise ValueError("--batch_size must be at least 1.")
-    if args.height % 32 or args.width % 32:
-        raise ValueError("--height and --width must be divisible by 32.")
+    if (args.height is None) != (args.width is None):
+        raise ValueError("--height and --width must be provided together or both omitted.")
+    if args.backend == "sana" and args.batch_size != 1:
+        raise ValueError("Original-size dynamic SANA batch inference currently requires --batch_size 1.")
 
     records = load_metadata(args.dataset_metadata_path)
     items = selected_records(records, args)

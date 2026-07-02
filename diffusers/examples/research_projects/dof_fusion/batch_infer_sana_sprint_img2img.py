@@ -10,6 +10,8 @@ from PIL import Image
 from dof_utils import (
     add_metadata_args,
     add_pretrained_args,
+    prepare_dynamic_images,
+    restore_output_size,
     sample_output_path,
     sample_prompt,
     select_records,
@@ -27,8 +29,11 @@ def parse_args():
     parser.add_argument("--init_key", default=None)
     parser.add_argument("--prompt", default="a photorealistic all-in-focus photograph")
     parser.add_argument("--output_dir", required=True)
-    parser.add_argument("--height", type=int, default=1024)
-    parser.add_argument("--width", type=int, default=1024)
+    parser.add_argument("--height", type=int, default=None, help="Compatibility check; must match every A image.")
+    parser.add_argument("--width", type=int, default=None, help="Compatibility check; must match every A image.")
+    parser.add_argument("--max_pixels", type=int, default=None, help="Safety limit; never triggers resizing.")
+    parser.add_argument("--size_divisor", type=int, default=32)
+    parser.add_argument("--aspect_ratio_tolerance", type=float, default=0.01)
     parser.add_argument("--batch_size", type=int, default=1)
     parser.add_argument("--steps", type=int, choices=(1, 2, 3, 4), default=4)
     parser.add_argument("--strength", type=float, default=0.75)
@@ -44,8 +49,10 @@ def main():
     args = parse_args()
     if not torch.cuda.is_available():
         raise RuntimeError("该推理脚本需要 CUDA。")
-    if args.batch_size < 1 or args.height % 32 or args.width % 32 or not 0 < args.strength <= 1:
+    if args.batch_size != 1 or not 0 < args.strength <= 1:
         raise ValueError("batch size、尺寸或 strength 非法。")
+    if (args.height is None) != (args.width is None):
+        raise ValueError("--height and --width must be provided together or both omitted.")
     if int(args.steps * args.strength) < 1:
         raise ValueError("steps * strength 必须至少选择一个去噪步。")
     pipe, transformer, config = load_pipeline(args)
@@ -69,39 +76,42 @@ def main():
         chunk = pending[offset : offset + args.batch_size]
         try:
             images_a, images_b, init_images, prompts, generators = [], [], [], [], []
-            focus_a_items, focus_b_items = [], []
+            named_images = {}
             for index, record, _, _ in chunk:
                 edits = record[args.edit_key]
                 required = 4 if adapter_type == "ab_focus" else 2
                 if not isinstance(edits, list) or len(edits) < required:
                     raise ValueError(f"Sample {index} edit_image 至少需要 {required} 项。")
                 image_a = Image.open(resolve_data_path(edits[0], args.dataset_base_path)).convert("RGB")
+                if args.height is not None and image_a.size != (args.width, args.height):
+                    raise ValueError(f"Sample {index} A size must equal explicit --width/--height.")
                 images_a.append(image_a)
                 images_b.append(Image.open(resolve_data_path(edits[1], args.dataset_base_path)).convert("RGB"))
                 init_path = edits[0] if args.init_key is None else record[args.init_key]
                 init_images.append(Image.open(resolve_data_path(init_path, args.dataset_base_path)).convert("RGB"))
+                named_images = {"a": images_a[-1], "b": images_b[-1], "init": init_images[-1]}
                 prompts.append(sample_prompt(record, args.prompt_key, args.prompt))
                 seed = int(record.get(args.seed_key, args.seed + index))
                 generators.append(torch.Generator(device="cuda").manual_seed(seed))
                 if adapter_type == "ab_focus":
-                    focus_a_items.append(
-                        load_focus(resolve_data_path(edits[2], args.dataset_base_path), args.height, args.width)
-                    )
-                    focus_b_items.append(
-                        load_focus(resolve_data_path(edits[3], args.dataset_base_path), args.height, args.width)
-                    )
-            cond_a, cond_b = encode_condition_images(
-                pipe, images_a, images_b, args.height, args.width, torch.device("cuda")
+                    named_images["focus_a"] = Image.open(resolve_data_path(edits[2], args.dataset_base_path))
+                    named_images["focus_b"] = Image.open(resolve_data_path(edits[3], args.dataset_base_path))
+            prepared, size_info = prepare_dynamic_images(
+                named_images, args.max_pixels, args.size_divisor, args.aspect_ratio_tolerance
             )
-            focus_a = torch.cat(focus_a_items).to("cuda") if focus_a_items else None
-            focus_b = torch.cat(focus_b_items).to("cuda") if focus_b_items else None
+            canvas_width, canvas_height = size_info["canvas_size"]
+            cond_a, cond_b = encode_condition_images(
+                pipe, prepared["a"], prepared["b"], canvas_height, canvas_width, torch.device("cuda")
+            )
+            focus_a = load_focus(prepared["focus_a"]).to("cuda") if "focus_a" in prepared else None
+            focus_b = load_focus(prepared["focus_b"]).to("cuda") if "focus_b" in prepared else None
             with transformer.use_condition(cond_a, cond_b, focus_a, focus_b):
                 images = pipe(
                     prompt=prompts,
-                    image=init_images,
+                    image=prepared["init"],
                     strength=args.strength,
-                    height=args.height,
-                    width=args.width,
+                    height=canvas_height,
+                    width=canvas_width,
                     num_inference_steps=args.steps,
                     intermediate_timesteps=1.3 if args.steps == 2 else None,
                     guidance_scale=args.guidance_scale,
@@ -109,7 +119,7 @@ def main():
                     use_resolution_binning=False,
                 ).images
             for image, (_, _, destination, result) in zip(images, chunk):
-                image.save(destination)
+                restore_output_size(image, size_info).save(destination)
                 results.append(result)
                 print(destination)
         except Exception as error:

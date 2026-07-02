@@ -9,7 +9,7 @@ from PIL import Image
 from diffusers import SanaSprintImg2ImgPipeline
 from diffusers.utils.torch_utils import randn_tensor
 
-from dof_utils import add_metadata_args, add_pretrained_args
+from dof_utils import add_metadata_args, add_pretrained_args, prepare_dynamic_images, restore_output_size
 from infer_sana_sprint import load_focus, load_sana_adapter_pipeline
 from sana_dof import encode_condition_images, encode_vae_latents
 
@@ -56,8 +56,11 @@ def parse_args():
     parser.add_argument("--init_image", default=None, help="Defaults to A; may be a preliminary fusion image.")
     parser.add_argument("--output", required=True)
     parser.add_argument("--prompt", default="a photorealistic all-in-focus photograph")
-    parser.add_argument("--height", type=int, default=1024)
-    parser.add_argument("--width", type=int, default=1024)
+    parser.add_argument("--height", type=int, default=None, help="Compatibility check only; must equal A height.")
+    parser.add_argument("--width", type=int, default=None, help="Compatibility check only; must equal A width.")
+    parser.add_argument("--max_pixels", type=int, default=None, help="Safety limit; never triggers resizing.")
+    parser.add_argument("--size_divisor", type=int, default=32)
+    parser.add_argument("--aspect_ratio_tolerance", type=float, default=0.01)
     parser.add_argument("--steps", type=int, choices=(1, 2, 3, 4), default=4)
     parser.add_argument("--strength", type=float, default=0.75)
     parser.add_argument("--guidance_scale", type=float, default=4.5)
@@ -76,8 +79,8 @@ def main():
     args = parse_args()
     if not torch.cuda.is_available():
         raise RuntimeError("This reference script requires CUDA.")
-    if args.height % 32 or args.width % 32 or not 0 < args.strength <= 1:
-        raise ValueError("Dimensions must be divisible by 32 and strength must be in (0, 1].")
+    if not 0 < args.strength <= 1:
+        raise ValueError("strength must be in (0, 1].")
     if int(args.steps * args.strength) < 1:
         raise ValueError(
             "steps * strength must select at least one denoising step; one-step img2img needs strength=1."
@@ -86,30 +89,43 @@ def main():
     image_a = Image.open(args.image_a).convert("RGB")
     image_b = Image.open(args.image_b).convert("RGB")
     init_image = image_a if args.init_image is None else Image.open(args.init_image).convert("RGB")
+    if (args.height is None) != (args.width is None):
+        raise ValueError("--height and --width must be provided together or both omitted.")
+    if args.height is not None and image_a.size != (args.width, args.height):
+        raise ValueError("Explicit --height/--width must equal the original A size; A is never stretched.")
+    named_images = {"a": image_a, "b": image_b, "init": init_image}
+    if config.get("adapter_type", "ab") == "ab_focus":
+        if args.focus_a is None or args.focus_b is None:
+            raise ValueError("ab_focus adapter 推理必须提供 --focus_a 和 --focus_b。")
+        named_images["focus_a"] = Image.open(args.focus_a)
+        named_images["focus_b"] = Image.open(args.focus_b)
+    prepared, size_info = prepare_dynamic_images(
+        named_images, args.max_pixels, args.size_divisor, args.aspect_ratio_tolerance
+    )
+    canvas_width, canvas_height = size_info["canvas_size"]
     cond_a, cond_b = encode_condition_images(
-        pipe, image_a, image_b, args.height, args.width, torch.device("cuda")
+        pipe, prepared["a"], prepared["b"], canvas_height, canvas_width, torch.device("cuda")
     )
     focus_a = None
     focus_b = None
     if config.get("adapter_type", "ab") == "ab_focus":
-        if args.focus_a is None or args.focus_b is None:
-            raise ValueError("ab_focus adapter 推理必须提供 --focus_a 和 --focus_b。")
-        focus_a = load_focus(args.focus_a, args.height, args.width).to("cuda")
-        focus_b = load_focus(args.focus_b, args.height, args.width).to("cuda")
+        focus_a = load_focus(prepared["focus_a"]).to("cuda")
+        focus_b = load_focus(prepared["focus_b"]).to("cuda")
     generator = torch.Generator(device="cuda").manual_seed(args.seed)
     with transformer.use_condition(cond_a, cond_b, focus_a, focus_b):
         image = pipe(
             prompt=args.prompt,
-            image=init_image,
+            image=prepared["init"],
             strength=args.strength,
-            height=args.height,
-            width=args.width,
+            height=canvas_height,
+            width=canvas_width,
             num_inference_steps=args.steps,
             intermediate_timesteps=1.3 if args.steps == 2 else None,
             guidance_scale=args.guidance_scale,
             generator=generator,
             use_resolution_binning=False,
         ).images[0]
+    image = restore_output_size(image, size_info)
     output = Path(args.output)
     output.parent.mkdir(parents=True, exist_ok=True)
     image.save(output)
