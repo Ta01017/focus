@@ -1,4 +1,5 @@
 import json
+import math
 import random
 from pathlib import Path
 
@@ -71,8 +72,8 @@ def sample_prompt(record, prompt_key, fallback):
     return prompt
 
 
-def dynamic_image_size(reference_size, max_pixels, size_divisor=32):
-    """Return unchanged content size and a padded model canvas as (width, height)."""
+def dynamic_image_size(reference_size, max_pixels, size_divisor=32, downscale_if_exceeds_max_pixels=False):
+    """Return aspect-preserving content and padded model canvas sizes as (width, height)."""
     width, height = reference_size
     if width < 1 or height < 1:
         raise ValueError(f"Invalid reference image size {reference_size}.")
@@ -80,14 +81,24 @@ def dynamic_image_size(reference_size, max_pixels, size_divisor=32):
         raise ValueError("--max_pixels must be positive when provided.")
     if size_divisor < 1:
         raise ValueError("--size_divisor must be positive.")
+    content_width, content_height = width, height
     if max_pixels is not None and width * height > max_pixels:
-        raise ValueError(
-            f"A resolution {width}x{height} has {width * height} pixels, exceeding --max_pixels={max_pixels}. "
-            "Automatic downscaling is disabled to preserve source geometry. Increase --max_pixels explicitly."
-        )
-    canvas_width = ((width + size_divisor - 1) // size_divisor) * size_divisor
-    canvas_height = ((height + size_divisor - 1) // size_divisor) * size_divisor
-    return reference_size, (canvas_width, canvas_height)
+        if not downscale_if_exceeds_max_pixels:
+            raise ValueError(
+                f"A resolution {width}x{height} has {width * height} pixels, exceeding --max_pixels={max_pixels}. "
+                "Increase the limit or explicitly pass --downscale_if_exceeds_max_pixels."
+            )
+        scale = math.sqrt(max_pixels / (width * height))
+        content_width = max(1, int(math.floor(width * scale)))
+        content_height = max(1, int(math.floor(height * scale)))
+        while content_width * content_height > max_pixels:
+            if content_width >= content_height:
+                content_width -= 1
+            else:
+                content_height -= 1
+    canvas_width = ((content_width + size_divisor - 1) // size_divisor) * size_divisor
+    canvas_height = ((content_height + size_divisor - 1) // size_divisor) * size_divisor
+    return (content_width, content_height), (canvas_width, canvas_height)
 
 
 def validate_aspect_ratio(image_size, reference_size, label, tolerance=0.01):
@@ -127,17 +138,25 @@ def resize_and_pad_image(
         padding = ((0, pad_height), (0, pad_width))
         if array.ndim == 3:
             padding += ((0, 0),)
-        array = np.pad(array, padding, mode="edge")
+        array = np.pad(array, padding, mode="constant", constant_values=0)
         image = Image.fromarray(array, mode=mode)
     return image
 
 
-def prepare_dynamic_images(images, max_pixels, size_divisor=32, aspect_ratio_tolerance=0.01):
+def prepare_dynamic_images(
+    images,
+    max_pixels,
+    size_divisor=32,
+    aspect_ratio_tolerance=0.01,
+    downscale_if_exceeds_max_pixels=False,
+):
     """Prepare named PIL images using A as the geometry reference."""
     if "a" not in images:
         raise ValueError("Dynamic image preparation requires an 'a' image.")
     original_size = images["a"].size
-    content_size, canvas_size = dynamic_image_size(original_size, max_pixels, size_divisor)
+    content_size, canvas_size = dynamic_image_size(
+        original_size, max_pixels, size_divisor, downscale_if_exceeds_max_pixels
+    )
     prepared = {}
     for name, image in images.items():
         prepared[name] = resize_and_pad_image(
@@ -156,14 +175,55 @@ def prepare_dynamic_images(images, max_pixels, size_divisor=32, aspect_ratio_tol
     }
 
 
-def restore_output_size(image, size_info):
-    """Remove model padding; content pixels are never geometrically resized."""
+def prepare_inference_images(
+    images,
+    height=None,
+    width=None,
+    max_pixels=None,
+    size_divisor=32,
+    aspect_ratio_tolerance=0.01,
+    downscale_if_exceeds_max_pixels=False,
+):
+    """Prepare a fixed-size compatibility canvas or a dynamic A-referenced canvas."""
+    if (height is None) != (width is None):
+        raise ValueError("--height and --width must be provided together or both omitted.")
+    if height is None:
+        return prepare_dynamic_images(
+            images,
+            max_pixels,
+            size_divisor,
+            aspect_ratio_tolerance,
+            downscale_if_exceeds_max_pixels,
+        )
+    if height % size_divisor or width % size_divisor:
+        raise ValueError(f"Fixed --height/--width must be divisible by {size_divisor}.")
+    reference_size = images["a"].size
+    content_size = (width, height)
+    prepared = {
+        name: resize_and_pad_image(
+            image,
+            reference_size,
+            content_size,
+            content_size,
+            is_mask=name.startswith("focus"),
+            label=name,
+            aspect_ratio_tolerance=aspect_ratio_tolerance,
+        )
+        for name, image in images.items()
+    }
+    return prepared, {
+        "original_size": reference_size,
+        "content_size": content_size,
+        "canvas_size": content_size,
+    }
+
+
+def restore_output_size(image, size_info, restore_to_original_size=True):
+    """Remove model padding and optionally restore the exact original A size."""
     content_width, content_height = size_info["content_size"]
     image = image.crop((0, 0, content_width, content_height))
-    if image.size != size_info["original_size"]:
-        raise ValueError(
-            f"Unexpected restored size {image.size}; expected original A size {size_info['original_size']}."
-        )
+    if restore_to_original_size and image.size != size_info["original_size"]:
+        image = image.resize(size_info["original_size"], Image.Resampling.LANCZOS)
     return image
 
 
@@ -175,6 +235,7 @@ def paired_preprocess(
     max_pixels=None,
     size_divisor=32,
     aspect_ratio_tolerance=0.01,
+    downscale_if_exceeds_max_pixels=False,
 ):
     if resolution is None:
         return dynamic_paired_preprocess(
@@ -184,6 +245,7 @@ def paired_preprocess(
             max_pixels,
             size_divisor,
             aspect_ratio_tolerance,
+            downscale_if_exceeds_max_pixels,
         )
     targets = []
     images_a = []
@@ -234,11 +296,20 @@ def paired_preprocess(
         "focus_b_valid": focus_b_valid,
         "valid_mask": torch.ones(len(samples), 1, resolution, resolution, dtype=torch.float32),
         "prompts": [sample["prompt"] for sample in samples],
+        "original_sizes": [sample["cond_images"][0].size for sample in samples],
+        "content_sizes": [(resolution, resolution)] * len(samples),
+        "canvas_sizes": [(resolution, resolution)] * len(samples),
     }
 
 
 def dynamic_paired_preprocess(
-    samples, image_processor, training, max_pixels, size_divisor, aspect_ratio_tolerance
+    samples,
+    image_processor,
+    training,
+    max_pixels,
+    size_divisor,
+    aspect_ratio_tolerance,
+    downscale_if_exceeds_max_pixels,
 ):
     targets, images_a, images_b = [], [], []
     focus_a_items, focus_b_items = [], []
@@ -259,18 +330,22 @@ def dynamic_paired_preprocess(
         if len(sample["cond_images"]) > 3:
             named_images["focus_b"] = sample["cond_images"][3]
             focus_b_valid[batch_index] = 1
+        if training and random.random() < 0.5:
+            named_images = {
+                name: image.transpose(Image.Transpose.FLIP_LEFT_RIGHT) for name, image in named_images.items()
+            }
         prepared, size_info = prepare_dynamic_images(
-            named_images, max_pixels, size_divisor, aspect_ratio_tolerance
+            named_images,
+            max_pixels,
+            size_divisor,
+            aspect_ratio_tolerance,
+            downscale_if_exceeds_max_pixels,
         )
         if size_infos and size_info["canvas_size"] != size_infos[0]["canvas_size"]:
             raise ValueError(
                 "Dynamic-resolution samples in one batch have different model sizes. "
                 "Use --batch_size 1 or group samples by resolution."
             )
-        if training and random.random() < 0.5:
-            prepared = {
-                name: image.transpose(Image.Transpose.FLIP_LEFT_RIGHT) for name, image in prepared.items()
-            }
         size_infos.append(size_info)
         targets.append(prepared["target"])
         images_a.append(prepared["a"])
@@ -299,6 +374,9 @@ def dynamic_paired_preprocess(
         "valid_mask": torch.stack(valid_masks),
         "prompts": [sample["prompt"] for sample in samples],
         "size_infos": size_infos,
+        "original_sizes": [info["original_size"] for info in size_infos],
+        "content_sizes": [info["content_size"] for info in size_infos],
+        "canvas_sizes": [info["canvas_size"] for info in size_infos],
     }
 
 

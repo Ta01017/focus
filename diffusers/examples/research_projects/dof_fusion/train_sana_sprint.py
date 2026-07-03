@@ -44,6 +44,7 @@ def parse_args():
     parser.add_argument("--max_pixels", type=int, default=None, help="Safety limit only; images are never downscaled.")
     parser.add_argument("--size_divisor", type=int, default=32)
     parser.add_argument("--aspect_ratio_tolerance", type=float, default=0.01)
+    parser.add_argument("--downscale_if_exceeds_max_pixels", action="store_true")
     parser.add_argument("--batch_size", type=int, default=1)
     parser.add_argument("--gradient_accumulation_steps", type=int, default=1)
     parser.add_argument("--learning_rate", type=float, default=1e-4)
@@ -78,7 +79,8 @@ def adapter_config(args, latent_channels, global_step):
         "resolution": args.resolution,
         "max_pixels": args.max_pixels,
         "size_divisor": args.size_divisor,
-        "geometry_mode": "a_original_size_edge_pad_no_resize_no_crop",
+        "geometry_mode": "a_reference_dynamic_zero_pad",
+        "downscale_if_exceeds_max_pixels": args.downscale_if_exceeds_max_pixels,
         "prompt": args.prompt,
         "global_step": global_step,
     }
@@ -103,9 +105,9 @@ def save_adapter(accelerator, model, optimizer, directory, args, global_step, ep
 
 def main():
     args = parse_args()
-    if args.resolution is not None:
-        raise ValueError("E1-E3 已禁用固定正方形 --resolution；请省略它，并按需设置 --max_pixels。")
-    if args.batch_size != 1:
+    if args.resolution is not None and args.resolution % 32:
+        raise ValueError("--resolution 必须能被 32 整除。")
+    if args.resolution is None and args.batch_size != 1:
         raise ValueError("动态分辨率训练当前要求 --batch_size 1；请使用梯度累积扩大有效 batch。")
     if args.adapter_type == "ab_focus":
         args.use_focus_maps = True
@@ -173,6 +175,7 @@ def main():
             max_pixels=args.max_pixels,
             size_divisor=args.size_divisor,
             aspect_ratio_tolerance=args.aspect_ratio_tolerance,
+            downscale_if_exceeds_max_pixels=args.downscale_if_exceeds_max_pixels,
         )
 
     dataloader = DataLoader(

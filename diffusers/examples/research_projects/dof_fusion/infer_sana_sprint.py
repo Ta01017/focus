@@ -14,7 +14,7 @@ from diffusers import SanaSprintPipeline
 from dof_utils import (
     add_metadata_args,
     add_pretrained_args,
-    prepare_dynamic_images,
+    prepare_inference_images,
     pretrained_kwargs,
     restore_output_size,
 )
@@ -36,6 +36,11 @@ def parse_args():
     parser.add_argument("--max_pixels", type=int, default=None, help="Safety limit; never triggers resizing.")
     parser.add_argument("--size_divisor", type=int, default=32)
     parser.add_argument("--aspect_ratio_tolerance", type=float, default=0.01)
+    parser.add_argument("--downscale_if_exceeds_max_pixels", action="store_true")
+    restore_group = parser.add_mutually_exclusive_group()
+    restore_group.add_argument("--restore_to_original_size", dest="restore_to_original_size", action="store_true")
+    restore_group.add_argument("--no_restore_to_original_size", dest="restore_to_original_size", action="store_false")
+    parser.set_defaults(restore_to_original_size=True)
     parser.add_argument("--steps", type=int, choices=(1, 2, 3, 4), default=1)
     parser.add_argument("--guidance_scale", type=float, default=4.5)
     parser.add_argument("--seed", type=int, default=0)
@@ -81,18 +86,20 @@ def main():
     pipe, transformer, config = load_sana_adapter_pipeline(args)
     image_a = Image.open(args.image_a).convert("RGB")
     image_b = Image.open(args.image_b).convert("RGB")
-    if (args.height is None) != (args.width is None):
-        raise ValueError("--height 和 --width 必须同时提供或同时省略。")
-    if args.height is not None and image_a.size != (args.width, args.height):
-        raise ValueError("显式 --height/--width 必须与 A 原始尺寸一致；脚本不会拉伸 A。")
     named_images = {"a": image_a, "b": image_b}
     if config.get("adapter_type", "ab") == "ab_focus":
         if args.focus_a is None or args.focus_b is None:
             raise ValueError("ab_focus adapter 推理必须提供 --focus_a 和 --focus_b。")
         named_images["focus_a"] = Image.open(args.focus_a)
         named_images["focus_b"] = Image.open(args.focus_b)
-    prepared, size_info = prepare_dynamic_images(
-        named_images, args.max_pixels, args.size_divisor, args.aspect_ratio_tolerance
+    prepared, size_info = prepare_inference_images(
+        named_images,
+        args.height,
+        args.width,
+        args.max_pixels,
+        args.size_divisor,
+        args.aspect_ratio_tolerance,
+        args.downscale_if_exceeds_max_pixels,
     )
     canvas_width, canvas_height = size_info["canvas_size"]
     cond_a, cond_b = encode_condition_images(
@@ -115,7 +122,7 @@ def main():
             generator=generator,
             use_resolution_binning=False,
         ).images[0]
-    image = restore_output_size(image, size_info)
+    image = restore_output_size(image, size_info, args.restore_to_original_size)
     output = Path(args.output)
     output.parent.mkdir(parents=True, exist_ok=True)
     image.save(output)

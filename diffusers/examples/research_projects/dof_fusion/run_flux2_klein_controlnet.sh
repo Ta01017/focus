@@ -8,12 +8,19 @@ MODE=${MODE:-all} # train | infer | batch | all
 MODEL=${MODEL:-black-forest-labs/FLUX.2-klein-4B}
 DATASET_BASE_PATH=${DATASET_BASE_PATH:-data}
 METADATA=${METADATA:-${DATASET_BASE_PATH}/metadata.json}
+TRAIN_METADATA=${TRAIN_METADATA:-${METADATA}}
+VAL_METADATA=${VAL_METADATA:-${METADATA}}
 OUTPUT_DIR=${OUTPUT_DIR:-outputs/dof_fusion/flux2_klein_controlnet}
 IMAGE_A=${IMAGE_A:-${DATASET_BASE_PATH}/a.png}
 IMAGE_B=${IMAGE_B:-${DATASET_BASE_PATH}/b.png}
 FOCUS_MAP=${FOCUS_MAP:-${DATASET_BASE_PATH}/focus_a.png}
 CONTROL_INDEX=${CONTROL_INDEX:-2}
-RESOLUTION=${RESOLUTION:-1024}
+RESOLUTION=${RESOLUTION:-}
+MAX_PIXELS=${MAX_PIXELS:-}
+SIZE_DIVISOR=${SIZE_DIVISOR:-16}
+RESTORE_TO_ORIGINAL_SIZE=${RESTORE_TO_ORIGINAL_SIZE:-1}
+ASPECT_RATIO_TOLERANCE=${ASPECT_RATIO_TOLERANCE:-0.01}
+DOWNSCALE_IF_EXCEEDS_MAX_PIXELS=${DOWNSCALE_IF_EXCEEDS_MAX_PIXELS:-0}
 BATCH_SIZE=${BATCH_SIZE:-1}
 GRAD_ACCUM_STEPS=${GRAD_ACCUM_STEPS:-4}
 MAX_TRAIN_STEPS=${MAX_TRAIN_STEPS:-20000}
@@ -21,19 +28,42 @@ INFER_STEPS=${INFER_STEPS:-4}
 MIXED_PRECISION=${MIXED_PRECISION:-bf16}
 SEED=${SEED:-0}
 
+if [[ -z "${RESOLUTION}" && "${BATCH_SIZE}" != "1" ]]; then
+  echo "Dynamic resolution requires BATCH_SIZE=1" >&2
+  exit 2
+fi
+train_size_args=(--size_divisor "${SIZE_DIVISOR}" --aspect_ratio_tolerance "${ASPECT_RATIO_TOLERANCE}")
+infer_size_args=(--size_divisor "${SIZE_DIVISOR}" --aspect_ratio_tolerance "${ASPECT_RATIO_TOLERANCE}")
+if [[ -n "${RESOLUTION}" ]]; then
+  train_size_args+=(--resolution "${RESOLUTION}")
+  infer_size_args+=(--height "${RESOLUTION}" --width "${RESOLUTION}")
+elif [[ -n "${MAX_PIXELS}" ]]; then
+  train_size_args+=(--max_pixels "${MAX_PIXELS}")
+  infer_size_args+=(--max_pixels "${MAX_PIXELS}")
+fi
+if [[ "${DOWNSCALE_IF_EXCEEDS_MAX_PIXELS}" == "1" ]]; then
+  train_size_args+=(--downscale_if_exceeds_max_pixels)
+  infer_size_args+=(--downscale_if_exceeds_max_pixels)
+fi
+if [[ "${RESTORE_TO_ORIGINAL_SIZE}" == "1" ]]; then
+  infer_size_args+=(--restore_to_original_size)
+else
+  infer_size_args+=(--no_restore_to_original_size)
+fi
+
 run_train() {
   accelerate launch "${SCRIPT_DIR}/train_flux2_klein_controlnet.py" \
     --model "${MODEL}" \
-    --dataset_metadata_path "${METADATA}" \
+    --dataset_metadata_path "${TRAIN_METADATA}" \
     --dataset_base_path "${DATASET_BASE_PATH}" \
     --output_dir "${OUTPUT_DIR}" \
     --control_index "${CONTROL_INDEX}" \
-    --resolution "${RESOLUTION}" \
     --batch_size "${BATCH_SIZE}" \
     --gradient_accumulation_steps "${GRAD_ACCUM_STEPS}" \
     --gradient_checkpointing \
     --max_train_steps "${MAX_TRAIN_STEPS}" \
-    --mixed_precision "${MIXED_PRECISION}"
+    --mixed_precision "${MIXED_PRECISION}" \
+    "${train_size_args[@]}"
 }
 
 run_infer() {
@@ -44,24 +74,23 @@ run_infer() {
     --image_b "${IMAGE_B}" \
     --focus_map "${FOCUS_MAP}" \
     --output "${OUTPUT_DIR}/single_result.png" \
-    --height "${RESOLUTION}" \
-    --width "${RESOLUTION}" \
     --steps "${INFER_STEPS}" \
-    --seed "${SEED}"
+    --seed "${SEED}" \
+    "${infer_size_args[@]}"
 }
 
 run_batch() {
   python "${SCRIPT_DIR}/batch_infer_flux2_klein_controlnet.py" \
     --checkpoint "${OUTPUT_DIR}" \
     --model "${MODEL}" \
-    --dataset_metadata_path "${METADATA}" \
+    --dataset_metadata_path "${VAL_METADATA}" \
     --dataset_base_path "${DATASET_BASE_PATH}" \
     --output_dir "${OUTPUT_DIR}/batch" \
     --control_index "${CONTROL_INDEX}" \
-    --height "${RESOLUTION}" \
-    --width "${RESOLUTION}" \
     --steps "${INFER_STEPS}" \
-    --seed "${SEED}"
+    --seed "${SEED}" \
+    --batch_size "${BATCH_SIZE}" \
+    "${infer_size_args[@]}"
 }
 
 case "${MODE}" in

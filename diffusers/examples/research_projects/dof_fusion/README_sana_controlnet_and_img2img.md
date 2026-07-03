@@ -1,5 +1,9 @@
 # Ordinary SANA ControlNet and SANA-Sprint img2img
 
+> Resolution: dynamic A-referenced content is now the default. Inputs are padded on the right/bottom to a multiple
+> of 32, padding is excluded from loss, and inference restores A's original size. Explicit `--resolution 1024`
+> retains the old fixed mode; max-pixel downscaling requires `--downscale_if_exceeds_max_pixels`.
+
 These routes are additional experiments. They do not modify files under `src/diffusers` and they retain the existing
 SANA-Sprint adapter and SANA-Sprint ControlNet code.
 

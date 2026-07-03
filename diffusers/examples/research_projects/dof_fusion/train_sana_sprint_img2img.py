@@ -43,6 +43,7 @@ def parse_args():
     parser.add_argument("--max_pixels", type=int, default=None, help="Safety limit only; images are never downscaled.")
     parser.add_argument("--size_divisor", type=int, default=32)
     parser.add_argument("--aspect_ratio_tolerance", type=float, default=0.01)
+    parser.add_argument("--downscale_if_exceeds_max_pixels", action="store_true")
     parser.add_argument("--batch_size", type=int, default=1)
     parser.add_argument("--gradient_accumulation_steps", type=int, default=1)
     parser.add_argument("--learning_rate", type=float, default=1e-4)
@@ -89,7 +90,8 @@ def save_checkpoint(accelerator, model, optimizer, directory, args, global_step,
         "resolution": args.resolution,
         "max_pixels": args.max_pixels,
         "size_divisor": args.size_divisor,
-        "geometry_mode": "a_original_size_edge_pad_no_resize_no_crop",
+        "geometry_mode": "a_reference_dynamic_zero_pad",
+        "downscale_if_exceeds_max_pixels": args.downscale_if_exceeds_max_pixels,
         "min_timestep": args.min_timestep,
         "max_timestep": args.max_timestep,
         "global_step": global_step,
@@ -102,9 +104,9 @@ def save_checkpoint(accelerator, model, optimizer, directory, args, global_step,
 
 def main():
     args = parse_args()
-    if args.resolution is not None:
-        raise ValueError("E4 disables fixed square --resolution; omit it and optionally set --max_pixels.")
-    if args.batch_size != 1:
+    if args.resolution is not None and args.resolution % 32:
+        raise ValueError("--resolution must be divisible by 32.")
+    if args.resolution is None and args.batch_size != 1:
         raise ValueError("Dynamic-resolution training currently requires --batch_size 1; use gradient accumulation.")
     if not 0 <= args.min_timestep < args.max_timestep <= 1.57080:
         raise ValueError("Require 0 <= min_timestep < max_timestep <= 1.57080.")
@@ -172,6 +174,7 @@ def main():
             max_pixels=args.max_pixels,
             size_divisor=args.size_divisor,
             aspect_ratio_tolerance=args.aspect_ratio_tolerance,
+            downscale_if_exceeds_max_pixels=args.downscale_if_exceeds_max_pixels,
         )
 
     dataloader = DataLoader(

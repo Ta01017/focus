@@ -9,7 +9,13 @@ from PIL import Image
 
 from diffusers import Flux2KleinPipeline
 
-from dof_utils import add_metadata_args, add_pretrained_args, pretrained_kwargs
+from dof_utils import (
+    add_metadata_args,
+    add_pretrained_args,
+    prepare_inference_images,
+    pretrained_kwargs,
+    restore_output_size,
+)
 
 
 DEFAULT_PROMPT = (
@@ -27,8 +33,16 @@ def parse_args():
     parser.add_argument("--image_b", required=True, help="Second differently focused RGB image.")
     parser.add_argument("--output", required=True)
     parser.add_argument("--prompt", default=DEFAULT_PROMPT)
-    parser.add_argument("--height", type=int, default=1024)
-    parser.add_argument("--width", type=int, default=1024)
+    parser.add_argument("--height", type=int, default=None)
+    parser.add_argument("--width", type=int, default=None)
+    parser.add_argument("--max_pixels", type=int, default=None)
+    parser.add_argument("--size_divisor", type=int, default=16)
+    parser.add_argument("--aspect_ratio_tolerance", type=float, default=0.01)
+    parser.add_argument("--downscale_if_exceeds_max_pixels", action="store_true")
+    restore_group = parser.add_mutually_exclusive_group()
+    restore_group.add_argument("--restore_to_original_size", dest="restore_to_original_size", action="store_true")
+    restore_group.add_argument("--no_restore_to_original_size", dest="restore_to_original_size", action="store_false")
+    parser.set_defaults(restore_to_original_size=True)
     parser.add_argument("--steps", type=int, default=4)
     parser.add_argument("--guidance_scale", type=float, default=1.0)
     parser.add_argument("--seed", type=int, default=0)
@@ -40,13 +54,21 @@ def parse_args():
 
 def main():
     args = parse_args()
-    if args.height % 16 or args.width % 16:
-        raise ValueError("--height and --width must be divisible by 16.")
+    if args.size_divisor % 16:
+        raise ValueError("--size_divisor must be a multiple of 16 for FLUX.2 Klein.")
 
     image_a = Image.open(args.image_a).convert("RGB")
     image_b = Image.open(args.image_b).convert("RGB")
-    if image_a.size != image_b.size:
-        print(f"Warning: input A/B sizes differ before preprocessing: {image_a.size}, {image_b.size}.")
+    prepared, size_info = prepare_inference_images(
+        {"a": image_a, "b": image_b},
+        args.height,
+        args.width,
+        args.max_pixels,
+        args.size_divisor,
+        args.aspect_ratio_tolerance,
+        args.downscale_if_exceeds_max_pixels,
+    )
+    canvas_width, canvas_height = size_info["canvas_size"]
 
     training_config = {}
     if args.lora is not None:
@@ -70,14 +92,15 @@ def main():
 
     generator = torch.Generator(device=generator_device).manual_seed(args.seed)
     image = pipe(
-        image=[image_a, image_b],
+        image=[prepared["a"], prepared["b"]],
         prompt=args.prompt,
-        height=args.height,
-        width=args.width,
+        height=canvas_height,
+        width=canvas_width,
         num_inference_steps=args.steps,
         guidance_scale=args.guidance_scale,
         generator=generator,
     ).images[0]
+    image = restore_output_size(image, size_info, args.restore_to_original_size)
 
     output = Path(args.output)
     output.parent.mkdir(parents=True, exist_ok=True)

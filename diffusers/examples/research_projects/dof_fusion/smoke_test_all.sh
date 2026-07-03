@@ -3,6 +3,8 @@ set -euo pipefail
 
 SCRIPT_DIR=$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd)
 MODEL=${MODEL:-Efficient-Large-Model/Sana_Sprint_0.6B_1024px_diffusers}
+SANA_CONTROL_MODEL=${SANA_CONTROL_MODEL:-Efficient-Large-Model/Sana_600M_1024px_diffusers}
+FLUX_MODEL=${FLUX_MODEL:-black-forest-labs/FLUX.2-klein-4B}
 DATASET_BASE_PATH=${DATASET_BASE_PATH:?请设置 DATASET_BASE_PATH}
 METADATA=${METADATA:?请设置 METADATA}
 IMAGE_A=${IMAGE_A:?请设置 IMAGE_A}
@@ -22,6 +24,8 @@ if [[ "${LOCAL_FILES_ONLY}" == "1" ]]; then
 fi
 size_args=(--size_divisor "${SIZE_DIVISOR}")
 if [[ -n "${MAX_PIXELS}" ]]; then size_args+=(--max_pixels "${MAX_PIXELS}"); fi
+flux_size_args=(--size_divisor 16)
+if [[ -n "${MAX_PIXELS}" ]]; then flux_size_args+=(--max_pixels "${MAX_PIXELS}"); fi
 if [[ -n "${CACHE_DIR}" ]]; then
   pretrained_args+=(--cache_dir "${CACHE_DIR}")
 fi
@@ -129,4 +133,70 @@ python "${SCRIPT_DIR}/batch_infer_sana_sprint_img2img.py" \
   "${size_args[@]}" \
   "${pretrained_args[@]}"
 
-echo "E1-E4 smoke tests passed."
+verify_route() {
+  local single_output=$1
+  local metadata_results=$2
+  python "${SCRIPT_DIR}/verify_dof_outputs.py" --reference "${IMAGE_A}" --output "${single_output}"
+  python "${SCRIPT_DIR}/verify_dof_outputs.py" \
+    --metadata_results "${metadata_results}" \
+    --dataset_base_path "${DATASET_BASE_PATH}"
+}
+
+SANA_CONTROL_DIR="${OUTPUT_ROOT}/sana_controlnet_dynamic"
+accelerate launch "${SCRIPT_DIR}/train_sana_controlnet.py" \
+  --model "${SANA_CONTROL_MODEL}" \
+  --dataset_metadata_path "${METADATA}" \
+  --dataset_base_path "${DATASET_BASE_PATH}" \
+  --output_dir "${SANA_CONTROL_DIR}" \
+  --batch_size 1 --num_workers 0 --max_samples 2 --max_train_steps 2 --save_steps 1 \
+  "${size_args[@]}" "${pretrained_args[@]}"
+python "${SCRIPT_DIR}/infer_sana_controlnet.py" \
+  --checkpoint "${SANA_CONTROL_DIR}" --model "${SANA_CONTROL_MODEL}" \
+  --image_a "${IMAGE_A}" --image_b "${IMAGE_B}" --focus_map "${FOCUS_A}" \
+  --output "${SANA_CONTROL_DIR}/single.png" \
+  "${size_args[@]}" "${pretrained_args[@]}"
+python "${SCRIPT_DIR}/batch_infer_sana_controlnet.py" \
+  --checkpoint "${SANA_CONTROL_DIR}" --model "${SANA_CONTROL_MODEL}" \
+  --dataset_metadata_path "${METADATA}" --dataset_base_path "${DATASET_BASE_PATH}" \
+  --output_dir "${SANA_CONTROL_DIR}/batch" --batch_size 1 --max_samples 2 \
+  "${size_args[@]}" "${pretrained_args[@]}"
+verify_route "${SANA_CONTROL_DIR}/single.png" "${SANA_CONTROL_DIR}/batch/metadata_results.json"
+
+FLUX_LORA_DIR="${OUTPUT_ROOT}/flux2_lora_dynamic"
+accelerate launch "${SCRIPT_DIR}/train_flux2_klein.py" \
+  --model "${FLUX_MODEL}" \
+  --dataset_metadata_path "${METADATA}" --dataset_base_path "${DATASET_BASE_PATH}" \
+  --output_dir "${FLUX_LORA_DIR}" \
+  --batch_size 1 --num_workers 0 --max_samples 2 --max_train_steps 2 --save_steps 1 \
+  "${flux_size_args[@]}" "${pretrained_args[@]}"
+python "${SCRIPT_DIR}/infer_flux2_klein.py" \
+  --model "${FLUX_MODEL}" --lora "${FLUX_LORA_DIR}" \
+  --image_a "${IMAGE_A}" --image_b "${IMAGE_B}" --output "${FLUX_LORA_DIR}/single.png" \
+  "${flux_size_args[@]}" "${pretrained_args[@]}"
+python "${SCRIPT_DIR}/batch_infer.py" \
+  --backend flux2 --model "${FLUX_MODEL}" --lora "${FLUX_LORA_DIR}" \
+  --dataset_metadata_path "${METADATA}" --dataset_base_path "${DATASET_BASE_PATH}" \
+  --output_dir "${FLUX_LORA_DIR}/batch" --batch_size 1 --max_samples 2 \
+  "${flux_size_args[@]}" "${pretrained_args[@]}"
+verify_route "${FLUX_LORA_DIR}/single.png" "${FLUX_LORA_DIR}/batch/metadata_results.json"
+
+FLUX_CONTROL_DIR="${OUTPUT_ROOT}/flux2_controlnet_dynamic"
+accelerate launch "${SCRIPT_DIR}/train_flux2_klein_controlnet.py" \
+  --model "${FLUX_MODEL}" \
+  --dataset_metadata_path "${METADATA}" --dataset_base_path "${DATASET_BASE_PATH}" \
+  --output_dir "${FLUX_CONTROL_DIR}" \
+  --batch_size 1 --num_workers 0 --max_samples 2 --max_train_steps 2 --save_steps 1 \
+  "${flux_size_args[@]}" "${pretrained_args[@]}"
+python "${SCRIPT_DIR}/infer_flux2_klein_controlnet.py" \
+  --checkpoint "${FLUX_CONTROL_DIR}" --model "${FLUX_MODEL}" \
+  --image_a "${IMAGE_A}" --image_b "${IMAGE_B}" --focus_map "${FOCUS_A}" \
+  --output "${FLUX_CONTROL_DIR}/single.png" \
+  "${flux_size_args[@]}" "${pretrained_args[@]}"
+python "${SCRIPT_DIR}/batch_infer_flux2_klein_controlnet.py" \
+  --checkpoint "${FLUX_CONTROL_DIR}" --model "${FLUX_MODEL}" \
+  --dataset_metadata_path "${METADATA}" --dataset_base_path "${DATASET_BASE_PATH}" \
+  --output_dir "${FLUX_CONTROL_DIR}/batch" --batch_size 1 --max_samples 2 \
+  "${flux_size_args[@]}" "${pretrained_args[@]}"
+verify_route "${FLUX_CONTROL_DIR}/single.png" "${FLUX_CONTROL_DIR}/batch/metadata_results.json"
+
+echo "All dynamic-resolution smoke tests passed."

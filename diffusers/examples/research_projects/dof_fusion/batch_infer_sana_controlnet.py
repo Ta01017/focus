@@ -10,7 +10,9 @@ from PIL import Image
 from dof_utils import (
     add_metadata_args,
     add_pretrained_args,
+    prepare_inference_images,
     pretrained_kwargs,
+    restore_output_size,
     sample_output_path,
     sample_prompt,
     select_records,
@@ -29,8 +31,16 @@ def parse_args():
     parser.add_argument("--control_index", type=int, choices=(2, 3), default=None)
     parser.add_argument("--prompt", default="a photorealistic all-in-focus photograph")
     parser.add_argument("--output_dir", required=True)
-    parser.add_argument("--height", type=int, default=1024)
-    parser.add_argument("--width", type=int, default=1024)
+    parser.add_argument("--height", type=int, default=None)
+    parser.add_argument("--width", type=int, default=None)
+    parser.add_argument("--max_pixels", type=int, default=None)
+    parser.add_argument("--size_divisor", type=int, default=32)
+    parser.add_argument("--aspect_ratio_tolerance", type=float, default=0.01)
+    parser.add_argument("--downscale_if_exceeds_max_pixels", action="store_true")
+    restore_group = parser.add_mutually_exclusive_group()
+    restore_group.add_argument("--restore_to_original_size", dest="restore_to_original_size", action="store_true")
+    restore_group.add_argument("--no_restore_to_original_size", dest="restore_to_original_size", action="store_false")
+    parser.set_defaults(restore_to_original_size=True)
     parser.add_argument("--batch_size", type=int, default=1)
     parser.add_argument("--steps", type=int, default=20)
     parser.add_argument("--guidance_scale", type=float, default=4.5)
@@ -43,8 +53,10 @@ def main():
     args = parse_args()
     if not torch.cuda.is_available():
         raise RuntimeError("This reference script requires CUDA.")
-    if args.batch_size < 1 or args.height % 32 or args.width % 32:
-        raise ValueError("Batch size must be positive and image dimensions divisible by 32.")
+    if args.batch_size < 1:
+        raise ValueError("Batch size must be positive.")
+    if args.height is None and args.batch_size != 1:
+        raise ValueError("Dynamic-resolution batch inference requires --batch_size 1.")
     dtype = torch.bfloat16 if torch.cuda.is_bf16_supported() else torch.float16
     pipe, transformer, scale, config = load_pipeline(
         Path(args.checkpoint), args.model, dtype, args.conditioning_scale, pretrained_kwargs(args)
@@ -68,38 +80,49 @@ def main():
     for offset in range(0, len(pending), args.batch_size):
         chunk = pending[offset : offset + args.batch_size]
         try:
-            images_a, images_b, controls, prompts, generators = [], [], [], [], []
+            images_a, images_b, controls, prompts, generators, size_infos = [], [], [], [], [], []
             for index, record, _, _ in chunk:
                 edits = record[args.edit_key]
                 if not isinstance(edits, list) or len(edits) <= control_index:
                     raise ValueError(f"Sample {index} must contain A, B, and control index {control_index}.")
-                images_a.append(Image.open(resolve_data_path(edits[0], args.dataset_base_path)).convert("RGB"))
-                images_b.append(Image.open(resolve_data_path(edits[1], args.dataset_base_path)).convert("RGB"))
-                controls.append(
-                    Image.open(resolve_data_path(edits[control_index], args.dataset_base_path))
-                    .convert("L")
-                    .convert("RGB")
+                prepared, size_info = prepare_inference_images(
+                    {
+                        "a": Image.open(resolve_data_path(edits[0], args.dataset_base_path)).convert("RGB"),
+                        "b": Image.open(resolve_data_path(edits[1], args.dataset_base_path)).convert("RGB"),
+                        "focus": Image.open(resolve_data_path(edits[control_index], args.dataset_base_path)),
+                    },
+                    args.height,
+                    args.width,
+                    args.max_pixels,
+                    args.size_divisor,
+                    args.aspect_ratio_tolerance,
+                    args.downscale_if_exceeds_max_pixels,
                 )
+                images_a.append(prepared["a"])
+                images_b.append(prepared["b"])
+                controls.append(prepared["focus"].convert("RGB"))
+                size_infos.append(size_info)
                 prompts.append(sample_prompt(record, args.prompt_key, args.prompt))
                 seed = int(record.get(args.seed_key, args.seed + index))
                 generators.append(torch.Generator(device="cuda").manual_seed(seed))
+            canvas_width, canvas_height = size_infos[0]["canvas_size"]
             cond_a, cond_b = encode_condition_images(
-                pipe, images_a, images_b, args.height, args.width, torch.device("cuda")
+                pipe, images_a, images_b, canvas_height, canvas_width, torch.device("cuda")
             )
             with transformer.use_condition(cond_a, cond_b):
                 images = pipe(
                     prompt=prompts,
                     control_image=controls,
-                    height=args.height,
-                    width=args.width,
+                    height=canvas_height,
+                    width=canvas_width,
                     num_inference_steps=args.steps,
                     guidance_scale=args.guidance_scale,
                     controlnet_conditioning_scale=scale,
                     generator=generators,
                     use_resolution_binning=False,
                 ).images
-            for image, (_, _, destination, result) in zip(images, chunk):
-                image.save(destination)
+            for image, size_info, (_, _, destination, result) in zip(images, size_infos, chunk):
+                restore_output_size(image, size_info, args.restore_to_original_size).save(destination)
                 results.append(result)
                 print(destination)
         except Exception as error:

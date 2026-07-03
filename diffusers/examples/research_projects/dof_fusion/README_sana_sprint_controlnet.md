@@ -1,5 +1,8 @@
 # SANA-Sprint + focus-map ControlNet
 
+> Resolution: dynamic A-referenced content is the default, padded to a multiple of 32. Padding is excluded from
+> loss and inference restores A's original size. Dynamic mode currently requires `batch_size=1`.
+
 This is an additional route. It does not replace or modify the existing SANA dual-image adapter route.
 
 Architecture:
@@ -88,4 +91,3 @@ python examples/research_projects/dof_fusion/batch_infer_sana_sprint_controlnet.
   --steps 1 \
   --skip_existing
 ```
-

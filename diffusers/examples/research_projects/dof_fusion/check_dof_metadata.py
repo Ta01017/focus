@@ -7,7 +7,7 @@ from pathlib import Path
 import numpy as np
 from PIL import Image, ImageDraw, ImageOps
 
-from dof_utils import add_metadata_args, select_records, validate_aspect_ratio
+from dof_utils import add_metadata_args, dynamic_image_size, select_records, validate_aspect_ratio
 from metadata import load_metadata, resolve_data_path
 
 
@@ -22,6 +22,7 @@ def parse_args():
     parser.add_argument("--preview_size", type=int, default=256)
     parser.add_argument("--max_pixels", type=int, default=None, help="Safety limit; does not resize images.")
     parser.add_argument("--aspect_ratio_tolerance", type=float, default=0.01)
+    parser.add_argument("--downscale_if_exceeds_max_pixels", action="store_true")
     return parser.parse_args()
 
 
@@ -83,10 +84,9 @@ def main():
             if len(set(sizes)) > 1:
                 warnings.append({"index": index, "message": f"像素尺寸不同，将以 A 对齐: {sizes}"})
             reference_size = conditions[0].size
-            if args.max_pixels is not None and reference_size[0] * reference_size[1] > args.max_pixels:
-                raise ValueError(
-                    f"A resolution {reference_size} exceeds --max_pixels={args.max_pixels}; automatic resizing is disabled."
-                )
+            dynamic_image_size(
+                reference_size, args.max_pixels, 1, args.downscale_if_exceeds_max_pixels
+            )
             validate_aspect_ratio(target.size, reference_size, "target", args.aspect_ratio_tolerance)
             for condition_index, image in enumerate(conditions[1:], start=1):
                 label = ("B", "focus_a", "focus_b")[condition_index - 1]

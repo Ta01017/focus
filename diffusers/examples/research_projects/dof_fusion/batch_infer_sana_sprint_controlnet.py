@@ -10,7 +10,13 @@ from safetensors.torch import load_file
 
 from diffusers import SanaControlNetModel, SanaSprintPipeline
 
-from dof_utils import add_metadata_args, add_pretrained_args, pretrained_kwargs
+from dof_utils import (
+    add_metadata_args,
+    add_pretrained_args,
+    prepare_inference_images,
+    pretrained_kwargs,
+    restore_output_size,
+)
 from infer_sana_sprint_controlnet import load_focus_map
 from metadata import load_metadata, require_keys, resolve_data_path
 from sana_dof import DualImageConditionAdapter, encode_condition_images
@@ -31,8 +37,16 @@ def parse_args():
     parser.add_argument("--seed_key", default="seed")
     parser.add_argument("--result_key", default="generated_image")
     parser.add_argument("--output_dir", required=True)
-    parser.add_argument("--height", type=int, default=1024)
-    parser.add_argument("--width", type=int, default=1024)
+    parser.add_argument("--height", type=int, default=None)
+    parser.add_argument("--width", type=int, default=None)
+    parser.add_argument("--max_pixels", type=int, default=None)
+    parser.add_argument("--size_divisor", type=int, default=32)
+    parser.add_argument("--aspect_ratio_tolerance", type=float, default=0.01)
+    parser.add_argument("--downscale_if_exceeds_max_pixels", action="store_true")
+    restore_group = parser.add_mutually_exclusive_group()
+    restore_group.add_argument("--restore_to_original_size", dest="restore_to_original_size", action="store_true")
+    restore_group.add_argument("--no_restore_to_original_size", dest="restore_to_original_size", action="store_false")
+    parser.set_defaults(restore_to_original_size=True)
     parser.add_argument("--batch_size", type=int, default=1)
     parser.add_argument("--steps", type=int, choices=(1, 2, 3, 4), default=1)
     parser.add_argument("--guidance_scale", type=float, default=4.5)
@@ -59,8 +73,8 @@ def main():
         raise RuntimeError("This reference script currently requires CUDA.")
     if args.batch_size < 1:
         raise ValueError("--batch_size must be at least 1.")
-    if args.height % 32 or args.width % 32:
-        raise ValueError("--height and --width must be divisible by 32.")
+    if args.height is None and args.batch_size != 1:
+        raise ValueError("Dynamic-resolution batch inference requires --batch_size 1.")
 
     checkpoint = Path(args.checkpoint)
     config = json.loads((checkpoint / "controlnet_config.json").read_text(encoding="utf-8"))
@@ -110,47 +124,50 @@ def main():
     for offset in range(0, len(pending), args.batch_size):
         chunk = pending[offset : offset + args.batch_size]
         try:
-            images_a = []
-            images_b = []
-            focus_maps = []
+            images_a, images_b, focus_maps, size_infos = [], [], [], []
             prompts = []
             generators = []
             for index, record, _, _ in chunk:
                 edit_images = record[args.edit_key]
-                images_a.append(
-                    Image.open(resolve_data_path(edit_images[0], args.dataset_base_path)).convert("RGB")
+                prepared, size_info = prepare_inference_images(
+                    {
+                        "a": Image.open(resolve_data_path(edit_images[0], args.dataset_base_path)).convert("RGB"),
+                        "b": Image.open(resolve_data_path(edit_images[1], args.dataset_base_path)).convert("RGB"),
+                        "focus": Image.open(resolve_data_path(edit_images[control_index], args.dataset_base_path)),
+                    },
+                    args.height,
+                    args.width,
+                    args.max_pixels,
+                    args.size_divisor,
+                    args.aspect_ratio_tolerance,
+                    args.downscale_if_exceeds_max_pixels,
                 )
-                images_b.append(
-                    Image.open(resolve_data_path(edit_images[1], args.dataset_base_path)).convert("RGB")
-                )
-                focus_maps.append(
-                    load_focus_map(
-                        resolve_data_path(edit_images[control_index], args.dataset_base_path),
-                        args.height,
-                        args.width,
-                    )
-                )
+                images_a.append(prepared["a"])
+                images_b.append(prepared["b"])
+                focus_maps.append(load_focus_map(prepared["focus"]))
+                size_infos.append(size_info)
                 prompts.append(record.get(args.prompt_key) or args.prompt)
                 seed = int(record.get(args.seed_key, args.seed + index))
                 generators.append(torch.Generator(device="cuda").manual_seed(seed))
 
+            canvas_width, canvas_height = size_infos[0]["canvas_size"]
             cond_a_latents, cond_b_latents = encode_condition_images(
-                pipe, images_a, images_b, args.height, args.width, torch.device("cuda")
+                pipe, images_a, images_b, canvas_height, canvas_width, torch.device("cuda")
             )
             focus_map = torch.cat(focus_maps, dim=0).to("cuda")
             with conditioned_transformer.use_conditions(cond_a_latents, cond_b_latents, focus_map):
                 images = pipe(
                     prompt=prompts,
-                    height=args.height,
-                    width=args.width,
+                    height=canvas_height,
+                    width=canvas_width,
                     num_inference_steps=args.steps,
                     intermediate_timesteps=1.3 if args.steps == 2 else None,
                     guidance_scale=args.guidance_scale,
                     generator=generators,
                     use_resolution_binning=False,
                 ).images
-            for image, (index, _, destination, result) in zip(images, chunk):
-                image.save(destination)
+            for image, size_info, (index, _, destination, result) in zip(images, size_infos, chunk):
+                restore_output_size(image, size_info, args.restore_to_original_size).save(destination)
                 results.append(result)
                 print(f"[{index + 1}] {destination}")
         except Exception as error:

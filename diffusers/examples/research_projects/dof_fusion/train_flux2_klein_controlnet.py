@@ -37,7 +37,11 @@ def parse_args():
     parser.add_argument("--control_index", type=int, choices=(2, 3), default=2)
     parser.add_argument("--prompt", default="a photorealistic all-in-focus photograph")
     parser.add_argument("--output_dir", required=True)
-    parser.add_argument("--resolution", type=int, default=1024)
+    parser.add_argument("--resolution", type=int, default=None)
+    parser.add_argument("--max_pixels", type=int, default=None)
+    parser.add_argument("--size_divisor", type=int, default=16)
+    parser.add_argument("--aspect_ratio_tolerance", type=float, default=0.01)
+    parser.add_argument("--downscale_if_exceeds_max_pixels", action="store_true")
     parser.add_argument("--batch_size", type=int, default=1)
     parser.add_argument("--gradient_accumulation_steps", type=int, default=1)
     parser.add_argument("--num_workers", type=int, default=4)
@@ -92,6 +96,12 @@ def save_checkpoint(accelerator, model, optimizer, directory, args, global_step,
         "single_block_indices": list(model.controlnet.single_block_indices),
         "conditioning_scale": args.conditioning_scale,
         "resolution": args.resolution,
+        "dynamic_resolution": args.resolution is None,
+        "max_pixels": args.max_pixels,
+        "size_divisor": args.size_divisor,
+        "aspect_ratio_tolerance": args.aspect_ratio_tolerance,
+        "downscale_if_exceeds_max_pixels": args.downscale_if_exceeds_max_pixels,
+        "valid_mask_loss": True,
         "global_step": global_step,
     }
     (directory / "controlnet_config.json").write_text(
@@ -102,8 +112,12 @@ def save_checkpoint(accelerator, model, optimizer, directory, args, global_step,
 
 def main():
     args = parse_args()
-    if args.resolution % 16:
+    if args.resolution is not None and args.resolution % 16:
         raise ValueError("--resolution must be divisible by 16.")
+    if args.resolution is None and args.batch_size != 1:
+        raise ValueError("Dynamic-resolution FLUX.2 ControlNet training requires --batch_size 1.")
+    if args.size_divisor % 16:
+        raise ValueError("--size_divisor must be a multiple of 16 for FLUX.2 Klein.")
     if args.control_hidden_channels < 1 or args.control_layers < 1:
         raise ValueError("ControlNet dimensions must be positive.")
     if args.focus_mask_gamma <= 0:
@@ -172,7 +186,16 @@ def main():
     )
 
     def collate_fn(samples):
-        batch = paired_preprocess(samples, args.resolution, pipe.image_processor, training=True)
+        batch = paired_preprocess(
+            samples,
+            args.resolution,
+            pipe.image_processor,
+            training=True,
+            max_pixels=args.max_pixels,
+            size_divisor=args.size_divisor,
+            aspect_ratio_tolerance=args.aspect_ratio_tolerance,
+            downscale_if_exceeds_max_pixels=args.downscale_if_exceeds_max_pixels,
+        )
         batch["focus_map"] = batch["focus_a"] if args.control_index == 2 else batch["focus_b"]
         return batch
 
@@ -268,14 +291,21 @@ def main():
                 target_velocity = noise - target
                 weighting = compute_loss_weighting_for_sd3(args.weighting_scheme, sigmas=sigmas)
                 error = prediction.float() - target_velocity.float()
-                loss = (weighting.float() * error.square()).reshape(target.shape[0], -1).mean(dim=1).mean()
+                latent_valid_mask = F.interpolate(
+                    batch["valid_mask"].to(accelerator.device), size=target.shape[-2:], mode="nearest"
+                )
+                denominator = (latent_valid_mask.sum() * target.shape[1]).clamp_min(1)
+                loss = (weighting.float() * error.square() * latent_valid_mask).sum() / denominator
                 if args.focus_loss_weight > 0:
                     predicted_target = noisy - sigmas * prediction
                     mask = focus.pow(args.focus_mask_gamma)
                     focus_weight = args.focus_keep_weight * mask + args.focus_blur_weight * (1 - mask)
-                    loss = loss + args.focus_loss_weight * (
-                        (predicted_target.float() - target.float()).abs() * focus_weight
-                    ).mean()
+                    focus_l1 = (
+                        (predicted_target.float() - target.float()).abs()
+                        * focus_weight
+                        * latent_valid_mask
+                    ).sum() / denominator
+                    loss = loss + args.focus_loss_weight * focus_l1
                 accelerator.backward(loss)
                 if accelerator.sync_gradients:
                     accelerator.clip_grad_norm_(controlnet.parameters(), 1.0)

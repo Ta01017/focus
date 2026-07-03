@@ -208,8 +208,10 @@ python examples/research_projects/dof_fusion/check_dof_metadata.py \
   --report_output outputs/metadata_report.json
 ```
 
-一次运行 E1～E4 的工程 smoke test。每个实验训练 2 steps，然后执行一次单张推理和一次单样本 batch
-推理，任何命令失败都会立即 `exit 1`：
+工程 smoke test 会覆盖 E1～E4，并额外验证普通 SANA ControlNet、FLUX2 Klein LoRA 和 FLUX2 Klein
+ControlNet 的动态分辨率闭环。新增三条路线各训练 2 steps、读取最多 2 个样本，随后运行单图和 batch
+推理；脚本还会检查输出尺寸与 A 一致、`metadata_results.json` 包含 `generated_image`。任何失败都会
+立即 `exit 1`：
 
 ```bash
 DATASET_BASE_PATH=/data/dof \
@@ -296,15 +298,20 @@ edit_image[3] = focus_b 或 focus_b_warp（可选）
 ]
 ```
 
-E1～E4 默认以 A 的原始宽高为准，不把图像拉伸成正方形，也不缩放或裁掉 A 的有效内容：
+所有 DOF 路线（SANA/Sprint、FLUX2 Klein LoRA、FLUX2 Klein ControlNet）默认以 A 的原始宽高为准，
+不强制变成 `1024x1024`：
 
-- A 只在右侧和底部使用 edge padding 补齐到 32 的倍数，模型输出后只移除这部分人工 padding。
+- A 只在右侧和底部使用 zero padding 补齐到模型要求的倍数，模型输出后只移除这部分人工 padding。
 - B、GT、focus_a、focus_b 如果像素尺寸不同但宽高比与 A 一致，会对齐到 A 的宽高。
 - 宽高比误差超过 `--aspect_ratio_tolerance`（默认 1%）会报错，不会静默拉伸不匹配的数据。
-- `--max_pixels` 是可选的最大像素安全检查。小于上限时保持不变；超过上限时报错，不会自动缩小。
+- `--max_pixels` 默认不限制。设置后，小于上限时保持不变；超过上限默认报错。
+- 只有显式增加 `--downscale_if_exceeds_max_pixels`，超限图像才会保持宽高比等比例缩小；输出默认仍恢复到 A 原始尺寸。
 - 动态原尺寸训练和 batch 推理当前要求 `--batch_size 1`，可用梯度累积增大有效 batch。
+- SANA/SANA-Sprint 的 `--size_divisor` 默认 32；FLUX2 Klein 默认 16。
+- loss 只在 `valid_mask=1` 的 content 区域计算，padding 区域不参与 latent loss 或 focus loss。
+- 显式传入 `--resolution 1024` 仍走旧固定正方形训练模式；推理对应传 `--height 1024 --width 1024`。
 
-例如 `A=1920x1080` 时，模型画布仅 padding 为 `1920x1088`，最后输出仍严格为 `1920x1080`。
+例如 `A=1920x1080` 时，SANA 模型画布仅 padding 为 `1920x1088`，最后输出仍严格为 `1920x1080`。
 
 所有训练、单图推理和批量推理入口统一接受以下 metadata 参数（单图入口可只传 `--image_a`、
 `--image_b`，这些 metadata 参数用于保持自动化调用接口一致）：

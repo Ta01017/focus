@@ -46,7 +46,11 @@ def parse_args():
     parser.set_defaults(use_focus_maps=False)
     parser.add_argument("--prompt", default="a photorealistic all-in-focus photograph")
     parser.add_argument("--output_dir", required=True)
-    parser.add_argument("--resolution", type=int, default=1024)
+    parser.add_argument("--resolution", type=int, default=None)
+    parser.add_argument("--max_pixels", type=int, default=None)
+    parser.add_argument("--size_divisor", type=int, default=16)
+    parser.add_argument("--aspect_ratio_tolerance", type=float, default=0.01)
+    parser.add_argument("--downscale_if_exceeds_max_pixels", action="store_true")
     parser.add_argument("--batch_size", type=int, default=1)
     parser.add_argument("--gradient_accumulation_steps", type=int, default=1)
     parser.add_argument("--num_workers", type=int, default=4)
@@ -73,8 +77,12 @@ def parse_args():
 
 
 def validate_args(args):
-    if args.resolution % 16:
+    if args.resolution is not None and args.resolution % 16:
         raise ValueError("--resolution must be divisible by 16 for FLUX.2 Klein.")
+    if args.resolution is None and args.batch_size != 1:
+        raise ValueError("Dynamic-resolution FLUX.2 training requires --batch_size 1.")
+    if args.size_divisor % 16:
+        raise ValueError("--size_divisor must be a multiple of 16 for FLUX.2 Klein.")
     if args.min_edit_images < 2:
         raise ValueError("--min_edit_images must be at least 2.")
     if args.focus_mask_gamma <= 0:
@@ -107,6 +115,12 @@ def save_lora(accelerator, transformer, optimizer, save_directory, args, global_
         "cond_format": "edit_image[A,B,optional_focus_a,optional_focus_b]",
         "use_focus_maps": args.use_focus_maps,
         "resolution": args.resolution,
+        "dynamic_resolution": args.resolution is None,
+        "max_pixels": args.max_pixels,
+        "size_divisor": args.size_divisor,
+        "aspect_ratio_tolerance": args.aspect_ratio_tolerance,
+        "downscale_if_exceeds_max_pixels": args.downscale_if_exceeds_max_pixels,
+        "valid_mask_loss": True,
         "rank": args.rank,
         "lora_alpha": args.lora_alpha,
         "global_step": global_step,
@@ -200,7 +214,16 @@ def main():
     )
 
     def collate_fn(samples):
-        return paired_preprocess(samples, args.resolution, pipe.image_processor, training=True)
+        return paired_preprocess(
+            samples,
+            args.resolution,
+            pipe.image_processor,
+            training=True,
+            max_pixels=args.max_pixels,
+            size_divisor=args.size_divisor,
+            aspect_ratio_tolerance=args.aspect_ratio_tolerance,
+            downscale_if_exceeds_max_pixels=args.downscale_if_exceeds_max_pixels,
+        )
 
     dataloader = DataLoader(
         dataset,
@@ -307,12 +330,12 @@ def main():
                     weighting_scheme=args.weighting_scheme,
                     sigmas=sigmas,
                 )
-                loss = torch.mean(
-                    (weighting.float() * (model_prediction.float() - target_velocity.float()) ** 2).reshape(
-                        target_latents.shape[0], -1
-                    ),
-                    dim=1,
-                ).mean()
+                error = model_prediction.float() - target_velocity.float()
+                latent_valid_mask = F.interpolate(
+                    batch["valid_mask"].to(accelerator.device), size=target_latents.shape[-2:], mode="nearest"
+                )
+                denominator = (latent_valid_mask.sum() * target_latents.shape[1]).clamp_min(1)
+                loss = (weighting.float() * error.square() * latent_valid_mask).sum() / denominator
 
                 if args.focus_loss_weight > 0 and batch["focus_a"] is not None:
                     predicted_target = noisy_latents - sigmas * model_prediction
@@ -327,8 +350,14 @@ def main():
                         args.focus_keep_weight * keep_mask + args.focus_blur_weight * (1 - keep_mask)
                     )
                     weighted_l1_per_sample = (
-                        (predicted_target.float() - target_latents.float()).abs() * focus_weight
-                    ).mean(dim=(1, 2, 3))
+                        (predicted_target.float() - target_latents.float()).abs()
+                        * focus_weight
+                        * latent_valid_mask
+                    ).sum(dim=(1, 2, 3))
+                    sample_denominator = (
+                        latent_valid_mask.sum(dim=(1, 2, 3)) * target_latents.shape[1]
+                    ).clamp_min(1)
+                    weighted_l1_per_sample = weighted_l1_per_sample / sample_denominator
                     focus_valid = batch["focus_a_valid"].to(accelerator.device)
                     weighted_l1 = (weighted_l1_per_sample * focus_valid).sum() / focus_valid.sum().clamp_min(1)
                     loss = loss + args.focus_loss_weight * weighted_l1

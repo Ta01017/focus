@@ -11,7 +11,13 @@ from safetensors.torch import load_file
 
 from diffusers import SanaControlNetModel, SanaSprintPipeline
 
-from dof_utils import add_metadata_args, add_pretrained_args, pretrained_kwargs
+from dof_utils import (
+    add_metadata_args,
+    add_pretrained_args,
+    prepare_inference_images,
+    pretrained_kwargs,
+    restore_output_size,
+)
 from sana_dof import DualImageConditionAdapter, encode_condition_images
 from sana_sprint_controlnet import SanaSprintFocusControlNetTransformer
 
@@ -25,8 +31,16 @@ def parse_args():
     parser.add_argument("--focus_map", required=True)
     parser.add_argument("--output", required=True)
     parser.add_argument("--prompt", default="a photorealistic all-in-focus photograph")
-    parser.add_argument("--height", type=int, default=1024)
-    parser.add_argument("--width", type=int, default=1024)
+    parser.add_argument("--height", type=int, default=None)
+    parser.add_argument("--width", type=int, default=None)
+    parser.add_argument("--max_pixels", type=int, default=None)
+    parser.add_argument("--size_divisor", type=int, default=32)
+    parser.add_argument("--aspect_ratio_tolerance", type=float, default=0.01)
+    parser.add_argument("--downscale_if_exceeds_max_pixels", action="store_true")
+    restore_group = parser.add_mutually_exclusive_group()
+    restore_group.add_argument("--restore_to_original_size", dest="restore_to_original_size", action="store_true")
+    restore_group.add_argument("--no_restore_to_original_size", dest="restore_to_original_size", action="store_false")
+    parser.set_defaults(restore_to_original_size=True)
     parser.add_argument("--steps", type=int, choices=(1, 2, 3, 4), default=1)
     parser.add_argument("--guidance_scale", type=float, default=4.5)
     parser.add_argument("--conditioning_scale", type=float, default=None)
@@ -36,9 +50,11 @@ def parse_args():
     return parser.parse_args()
 
 
-def load_focus_map(path: str, height: int, width: int) -> torch.Tensor:
-    focus = Image.open(path).convert("L")
-    focus = focus.resize((width, height), resample=Image.Resampling.BILINEAR)
+def load_focus_map(source, height=None, width=None) -> torch.Tensor:
+    focus = source if isinstance(source, Image.Image) else Image.open(source)
+    focus = focus.convert("L")
+    if height is not None and width is not None and focus.size != (width, height):
+        focus = focus.resize((width, height), resample=Image.Resampling.BILINEAR)
     focus = torch.from_numpy(np.asarray(focus, dtype=np.float32) / 255.0)
     return focus.unsqueeze(0).unsqueeze(0)
 
@@ -47,8 +63,6 @@ def main():
     args = parse_args()
     if not torch.cuda.is_available():
         raise RuntimeError("This reference script currently requires CUDA.")
-    if args.height % 32 or args.width % 32:
-        raise ValueError("--height and --width must be divisible by 32.")
 
     checkpoint = Path(args.checkpoint)
     config = json.loads((checkpoint / "controlnet_config.json").read_text(encoding="utf-8"))
@@ -82,25 +96,34 @@ def main():
 
     image_a = Image.open(args.image_a).convert("RGB")
     image_b = Image.open(args.image_b).convert("RGB")
-    if image_a.size != image_b.size:
-        print(f"Warning: input A/B sizes differ before preprocessing: {image_a.size}, {image_b.size}.")
-    cond_a_latents, cond_b_latents = encode_condition_images(
-        pipe, image_a, image_b, args.height, args.width, torch.device("cuda")
+    prepared, size_info = prepare_inference_images(
+        {"a": image_a, "b": image_b, "focus": Image.open(args.focus_map)},
+        args.height,
+        args.width,
+        args.max_pixels,
+        args.size_divisor,
+        args.aspect_ratio_tolerance,
+        args.downscale_if_exceeds_max_pixels,
     )
-    focus_map = load_focus_map(args.focus_map, args.height, args.width).to("cuda")
+    canvas_width, canvas_height = size_info["canvas_size"]
+    cond_a_latents, cond_b_latents = encode_condition_images(
+        pipe, prepared["a"], prepared["b"], canvas_height, canvas_width, torch.device("cuda")
+    )
+    focus_map = load_focus_map(prepared["focus"]).to("cuda")
 
     generator = torch.Generator(device="cuda").manual_seed(args.seed)
     with conditioned_transformer.use_conditions(cond_a_latents, cond_b_latents, focus_map):
         image = pipe(
             prompt=args.prompt,
-            height=args.height,
-            width=args.width,
+            height=canvas_height,
+            width=canvas_width,
             num_inference_steps=args.steps,
             intermediate_timesteps=1.3 if args.steps == 2 else None,
             guidance_scale=args.guidance_scale,
             generator=generator,
             use_resolution_binning=False,
         ).images[0]
+    image = restore_output_size(image, size_info, args.restore_to_original_size)
 
     output = Path(args.output)
     output.parent.mkdir(parents=True, exist_ok=True)

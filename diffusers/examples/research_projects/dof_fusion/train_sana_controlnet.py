@@ -37,7 +37,11 @@ def parse_args():
     parser.add_argument("--control_index", type=int, choices=(2, 3), default=2)
     parser.add_argument("--output_dir", required=True)
     parser.add_argument("--prompt", default="a photorealistic all-in-focus photograph")
-    parser.add_argument("--resolution", type=int, default=1024)
+    parser.add_argument("--resolution", type=int, default=None)
+    parser.add_argument("--max_pixels", type=int, default=None)
+    parser.add_argument("--size_divisor", type=int, default=32)
+    parser.add_argument("--aspect_ratio_tolerance", type=float, default=0.01)
+    parser.add_argument("--downscale_if_exceeds_max_pixels", action="store_true")
     parser.add_argument("--batch_size", type=int, default=1)
     parser.add_argument("--gradient_accumulation_steps", type=int, default=1)
     parser.add_argument("--learning_rate", type=float, default=1e-5)
@@ -82,6 +86,12 @@ def save_checkpoint(accelerator, model, optimizer, directory, args, global_step,
         "controlnet_layers": args.controlnet_layers,
         "conditioning_scale": args.conditioning_scale,
         "resolution": args.resolution,
+        "dynamic_resolution": args.resolution is None,
+        "max_pixels": args.max_pixels,
+        "size_divisor": args.size_divisor,
+        "aspect_ratio_tolerance": args.aspect_ratio_tolerance,
+        "downscale_if_exceeds_max_pixels": args.downscale_if_exceeds_max_pixels,
+        "valid_mask_loss": True,
         "global_step": global_step,
     }
     (directory / "controlnet_config.json").write_text(
@@ -92,8 +102,10 @@ def save_checkpoint(accelerator, model, optimizer, directory, args, global_step,
 
 def main():
     args = parse_args()
-    if args.resolution % 32:
+    if args.resolution is not None and args.resolution % 32:
         raise ValueError("--resolution must be divisible by 32.")
+    if args.resolution is None and args.batch_size != 1:
+        raise ValueError("Dynamic-resolution training requires --batch_size 1; use gradient accumulation.")
     if args.focus_mask_gamma <= 0:
         raise ValueError("--focus_mask_gamma must be greater than zero.")
 
@@ -155,7 +167,16 @@ def main():
     )
 
     def collate_fn(samples):
-        batch = paired_preprocess(samples, args.resolution, pipe.image_processor, training=True)
+        batch = paired_preprocess(
+            samples,
+            args.resolution,
+            pipe.image_processor,
+            training=True,
+            max_pixels=args.max_pixels,
+            size_divisor=args.size_divisor,
+            aspect_ratio_tolerance=args.aspect_ratio_tolerance,
+            downscale_if_exceeds_max_pixels=args.downscale_if_exceeds_max_pixels,
+        )
         focus = batch["focus_a"] if args.control_index == 2 else batch["focus_b"]
         batch["focus_map"] = focus
         batch["control"] = focus.repeat(1, 3, 1, 1) * 2 - 1
@@ -226,7 +247,12 @@ def main():
                     conditioning_scale=args.conditioning_scale,
                 ).float()
                 error = prediction - velocity_target.float()
-                loss = error.square().mean() + 0.1 * error.abs().mean()
+                valid_mask = F.interpolate(
+                    batch["valid_mask"].to(accelerator.device), size=error.shape[-2:], mode="nearest"
+                )
+                denominator = (valid_mask.sum() * error.shape[1]).clamp_min(1)
+                loss = (error.square() * valid_mask).sum() / denominator
+                loss = loss + 0.1 * (error.abs() * valid_mask).sum() / denominator
                 if args.focus_loss_weight > 0:
                     focus = F.interpolate(
                         batch["focus_map"].to(accelerator.device),
@@ -235,7 +261,8 @@ def main():
                         align_corners=False,
                     ).pow(args.focus_mask_gamma)
                     weight = args.focus_keep_weight * focus + args.focus_blur_weight * (1 - focus)
-                    loss = loss + args.focus_loss_weight * (error.abs() * weight).mean()
+                    focus_l1 = (error.abs() * weight * valid_mask).sum() / denominator
+                    loss = loss + args.focus_loss_weight * focus_l1
                 accelerator.backward(loss)
                 if accelerator.sync_gradients:
                     accelerator.clip_grad_norm_(trainable_parameters, 1.0)

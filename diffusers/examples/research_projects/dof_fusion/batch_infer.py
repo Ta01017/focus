@@ -13,7 +13,7 @@ from diffusers import Flux2KleinPipeline, SanaSprintPipeline
 from dof_utils import (
     add_metadata_args,
     add_pretrained_args,
-    prepare_dynamic_images,
+    prepare_inference_images,
     pretrained_kwargs,
     restore_output_size,
 )
@@ -38,8 +38,13 @@ def parse_args():
     parser.add_argument("--height", type=int, default=None, help="Compatibility check; must match every A image.")
     parser.add_argument("--width", type=int, default=None, help="Compatibility check; must match every A image.")
     parser.add_argument("--max_pixels", type=int, default=None, help="Safety limit; never triggers resizing.")
-    parser.add_argument("--size_divisor", type=int, default=32)
+    parser.add_argument("--size_divisor", type=int, default=None)
     parser.add_argument("--aspect_ratio_tolerance", type=float, default=0.01)
+    parser.add_argument("--downscale_if_exceeds_max_pixels", action="store_true")
+    restore_group = parser.add_mutually_exclusive_group()
+    restore_group.add_argument("--restore_to_original_size", dest="restore_to_original_size", action="store_true")
+    restore_group.add_argument("--no_restore_to_original_size", dest="restore_to_original_size", action="store_false")
+    parser.set_defaults(restore_to_original_size=True)
     parser.add_argument("--steps", type=int, default=None)
     parser.add_argument("--guidance_scale", type=float, default=None)
     parser.add_argument("--seed", type=int, default=0)
@@ -122,13 +127,14 @@ def run_flux2(items: list[tuple[int, dict]], args) -> list[dict]:
             continue
         try:
             image_a, image_b = load_condition_pair(record, index, args)
-            if args.height is not None and image_a.size != (args.width, args.height):
-                raise ValueError(f"Sample {index} A size must equal explicit --width/--height.")
-            prepared, size_info = prepare_dynamic_images(
+            prepared, size_info = prepare_inference_images(
                 {"a": image_a, "b": image_b},
+                args.height,
+                args.width,
                 args.max_pixels,
                 args.size_divisor,
                 args.aspect_ratio_tolerance,
+                args.downscale_if_exceeds_max_pixels,
             )
             canvas_width, canvas_height = size_info["canvas_size"]
             seed = int(record.get(args.seed_key, args.seed + index))
@@ -142,7 +148,7 @@ def run_flux2(items: list[tuple[int, dict]], args) -> list[dict]:
                 guidance_scale=guidance_scale,
                 generator=generator,
             ).images[0]
-            image = restore_output_size(image, size_info)
+            image = restore_output_size(image, size_info, args.restore_to_original_size)
             output.parent.mkdir(parents=True, exist_ok=True)
             image.save(output)
         except Exception as error:
@@ -196,8 +202,6 @@ def run_sana(items: list[tuple[int, dict]], args) -> list[dict]:
             pairs = [load_condition_pair(record, index, args) for index, record, _, _ in chunk]
             images_a = [pair[0] for pair in pairs]
             images_b = [pair[1] for pair in pairs]
-            if args.height is not None and images_a[0].size != (args.width, args.height):
-                raise ValueError(f"Sample {chunk[0][0]} A size must equal explicit --width/--height.")
             named_images = {"a": images_a[0], "b": images_b[0]}
             prompts = [
                 sample_prompt(record, args, "a photorealistic all-in-focus photograph")
@@ -216,8 +220,14 @@ def run_sana(items: list[tuple[int, dict]], args) -> list[dict]:
                     raise ValueError(f"Sample {index} requires edit_image[A,B,focus_a,focus_b].")
                 named_images["focus_a"] = Image.open(resolve_data_path(edits[2], args.dataset_base_path))
                 named_images["focus_b"] = Image.open(resolve_data_path(edits[3], args.dataset_base_path))
-            prepared, size_info = prepare_dynamic_images(
-                named_images, args.max_pixels, args.size_divisor, args.aspect_ratio_tolerance
+            prepared, size_info = prepare_inference_images(
+                named_images,
+                args.height,
+                args.width,
+                args.max_pixels,
+                args.size_divisor,
+                args.aspect_ratio_tolerance,
+                args.downscale_if_exceeds_max_pixels,
             )
             canvas_width, canvas_height = size_info["canvas_size"]
             cond_a_latents, cond_b_latents = encode_condition_images(
@@ -239,7 +249,7 @@ def run_sana(items: list[tuple[int, dict]], args) -> list[dict]:
                 ).images
             for image, (index, _, output, result) in zip(images, chunk):
                 output.parent.mkdir(parents=True, exist_ok=True)
-                restore_output_size(image, size_info).save(output)
+                restore_output_size(image, size_info, args.restore_to_original_size).save(output)
                 results.append(result)
                 print(f"[{index + 1}] {output}")
         except Exception as error:
@@ -257,8 +267,13 @@ def main():
         raise ValueError("--batch_size must be at least 1.")
     if (args.height is None) != (args.width is None):
         raise ValueError("--height and --width must be provided together or both omitted.")
-    if args.backend == "sana" and args.batch_size != 1:
-        raise ValueError("Original-size dynamic SANA batch inference currently requires --batch_size 1.")
+    if args.size_divisor is None:
+        args.size_divisor = 16 if args.backend == "flux2" else 32
+    required_divisor = 16 if args.backend == "flux2" else 32
+    if args.size_divisor % required_divisor:
+        raise ValueError(f"--size_divisor must be a multiple of {required_divisor} for {args.backend}.")
+    if args.height is None and args.batch_size != 1:
+        raise ValueError("Dynamic-resolution batch inference requires --batch_size 1.")
 
     records = load_metadata(args.dataset_metadata_path)
     items = selected_records(records, args)

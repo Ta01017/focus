@@ -14,6 +14,9 @@ IMAGE_B=${IMAGE_B:-${DATASET_BASE_PATH}/b.png}
 INIT_IMAGE=${INIT_IMAGE:-${IMAGE_A}}
 MAX_PIXELS=${MAX_PIXELS:-}
 SIZE_DIVISOR=${SIZE_DIVISOR:-32}
+ASPECT_RATIO_TOLERANCE=${ASPECT_RATIO_TOLERANCE:-0.01}
+DOWNSCALE_IF_EXCEEDS_MAX_PIXELS=${DOWNSCALE_IF_EXCEEDS_MAX_PIXELS:-0}
+RESTORE_TO_ORIGINAL_SIZE=${RESTORE_TO_ORIGINAL_SIZE:-1}
 BATCH_SIZE=${BATCH_SIZE:-1}
 GRAD_ACCUM_STEPS=${GRAD_ACCUM_STEPS:-4}
 MAX_TRAIN_STEPS=${MAX_TRAIN_STEPS:-20000}
@@ -36,8 +39,11 @@ resume_args=()
 if [[ -n "${RESUME_FROM_CHECKPOINT}" ]]; then
   resume_args+=(--resume_from_checkpoint "${RESUME_FROM_CHECKPOINT}")
 fi
-size_args=(--size_divisor "${SIZE_DIVISOR}")
+size_args=(--size_divisor "${SIZE_DIVISOR}" --aspect_ratio_tolerance "${ASPECT_RATIO_TOLERANCE}")
 if [[ -n "${MAX_PIXELS}" ]]; then size_args+=(--max_pixels "${MAX_PIXELS}"); fi
+if [[ "${DOWNSCALE_IF_EXCEEDS_MAX_PIXELS}" == "1" ]]; then size_args+=(--downscale_if_exceeds_max_pixels); fi
+restore_args=(--restore_to_original_size)
+if [[ "${RESTORE_TO_ORIGINAL_SIZE}" != "1" ]]; then restore_args=(--no_restore_to_original_size); fi
 
 run_train() {
   local focus_args=()
@@ -71,6 +77,7 @@ run_infer() {
     --strength "${STRENGTH}" \
     --seed "${SEED}" \
     "${size_args[@]}" \
+    "${restore_args[@]}" \
     "${pretrained_args[@]}"
 }
 
@@ -86,6 +93,7 @@ run_batch() {
     --strength "${STRENGTH}" \
     --seed "${SEED}" \
     "${size_args[@]}" \
+    "${restore_args[@]}" \
     "${pretrained_args[@]}"
 }
 
