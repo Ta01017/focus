@@ -236,6 +236,80 @@ python examples/research_projects/dof_fusion/eval_dof_results.py \
 评测项包括全图、keep 区域和 blur 区域的 PSNR、SSIM、L1，以及 Sobel edge L1。`focus_a` 白色表示
 保留 A 的清晰区域，黑色表示需要从 B 恢复。
 
+### 独立色差后处理
+
+色差处理不接入推理 pipeline，而是读取已经生成的 `metadata_results.json`。默认有 focus_a 时用它构造
+A/B 参考，没有时使用 A/B 平均参考；随后只在 CIELAB 的色度通道做空间配对的稳健中位数偏移，保留
+生成结果的亮度和锐度结构。与传统均值/方差迁移相比，该默认
+方法不依赖清晰度分布，因此 A/B 的模糊区域不容易把饱和度或对比度拉偏：
+
+```bash
+python examples/research_projects/dof_fusion/postprocess_dof_color.py \
+  --dataset_metadata_path outputs/sana/batch/metadata_results.json \
+  --dataset_base_path /data/dof \
+  --output_dir outputs/sana/color_corrected \
+  --reference_mode mean_ab \
+  --method paired_offset \
+  --channels chroma \
+  --strength 0.8
+```
+
+输出 metadata 保留原字段并新增 `color_corrected_image`。`reference_mode` 支持 `a`、`b`、`mean_ab`、
+`focus_composite`；`target` 仅用于带 GT 的离线分析，部署时不要用 GT 做颜色校正。
+
+推荐优先使用 `paired_offset + chroma`。它使用 A/B 与生成图的空间对应关系、截尾统计和中位数，只修正
+Lab 色度，并用 `--max_chroma_shift` 限制最大变化。`local_chroma` 可处理空间变化的色偏，但可能在景深
+边界产生低频颜色过渡；`reinhard --match_std` 可能放大模糊图的颜色方差，默认不开启。
+
+## SANA-Sprint 跨模型响应蒸馏
+
+FLUX2 与 SANA 的 VAE、latent 和 Transformer 不同，不能直接共享官方 sCM 的教师速度场/JVP。这里提供
+可运行的响应蒸馏：教师先离线生成 `teacher_image`，再用已经一步化的 SANA-Sprint 学习
+`A/B(/focus) -> teacher_image`。这会迁移任务效果，但不是重新执行 SANA-Sprint 的底层 sCM+LADD。
+
+```bash
+# Diffusers FLUX2 base teacher
+bash examples/research_projects/dof_fusion/run_distill_diffusers_flux2_to_sana_sprint.sh
+
+# DiffSynth FLUX2 teacher：命令模板中的占位符会按样本替换
+TEACHER_COMMAND='python your_diffsynth_infer.py --a {image_a} --b {image_b} --output {output}' \
+bash examples/research_projects/dof_fusion/run_distill_diffsynth_flux2_to_sana_sprint.sh
+
+# 任意已经训练好的 SANA DOF teacher
+TEACHER_COMMAND='python your_sana_infer.py --image_a {image_a} --image_b {image_b} --output {output}' \
+bash examples/research_projects/dof_fusion/run_distill_sana_to_sana_sprint.sh
+
+# 本目录的普通 SANA ControlNet teacher
+TEACHER_CHECKPOINT=outputs/sana_controlnet \
+bash examples/research_projects/dof_fusion/run_distill_sana_controlnet_to_sana_sprint.sh
+```
+
+四个入口最终都调用 `generate_dof_teacher_targets.py` 和 `train_sana_sprint.py --target_key teacher_image`。
+若要做严格的同架构 sCM，需要在官方 `examples/research_projects/sana/train_sana_sprint_diffusers.py`
+中加入 A/B Adapter、ControlNet condition、DiffSynth dataset 和 valid mask；不要把 FLUX2 教师直接接到该
+JVP loss。
+
+如果只有原始推理 metadata、其中还没有 `generated_image`，可以额外指定结果目录；默认按 batch 推理的
+`{index:06d}_{id}.png` 规则查找：
+
+```bash
+python examples/research_projects/dof_fusion/postprocess_dof_color.py \
+  --dataset_metadata_path data/metadata.json \
+  --dataset_base_path data \
+  --generated_dir outputs/sana/batch \
+  --output_dir outputs/sana/color_corrected
+```
+
+完全没有 JSON 时，也可以使用文件夹模式。每个子目录默认包含 `a.png`、`b.png`、`generated.png`，以及
+可选的 `focus_a.png`；文件名可通过 `--a_filename` 等参数修改。如果输入目录只有 A/B，可同时传
+`--generated_dir` 从单独的推理结果目录查找生成图：
+
+```bash
+python examples/research_projects/dof_fusion/postprocess_dof_color.py \
+  --input_dir data/postprocess_samples \
+  --output_dir outputs/color_corrected
+```
+
 ## 断点恢复与离线加载
 
 所有训练脚本支持：
