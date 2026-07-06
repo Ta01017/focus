@@ -1,0 +1,16 @@
+[
+  {
+    "id": "000000",
+    "image": "images/000000_target.png",
+    "edit_image": "images/000000_reference.png",
+    "prompt": "turn the product red",
+    "seed": 0
+  },
+  {
+    "id": "000001",
+    "image": "images/000001_target.png",
+    "edit_image": "images/000001_reference.png",
+    "prompt": "turn the product blue",
+    "seed": 1
+  }
+]

@@ -1,0 +1,12 @@
+[
+  {
+    "image": "images/000000_target.png",
+    "edit_image": "images/000000_reference.png",
+    "prompt": "apply the requested edit while preserving the subject"
+  },
+  {
+    "image": "images/000001_target.png",
+    "edit_image": "images/000001_reference.png",
+    "prompt": "apply the requested edit while preserving the subject"
+  }
+]
