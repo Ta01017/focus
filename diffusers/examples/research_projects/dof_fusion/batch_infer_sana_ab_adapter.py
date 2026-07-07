@@ -6,9 +6,6 @@ from pathlib import Path
 
 import torch
 from PIL import Image
-from safetensors.torch import load_file
-
-from diffusers import SanaPipeline
 
 from dof_utils import (
     add_metadata_args,
@@ -20,8 +17,9 @@ from dof_utils import (
     sample_prompt,
     select_records,
 )
+from infer_sana_ab_adapter import load_pipeline
 from metadata import load_metadata, require_keys, resolve_data_path
-from sana_dof import ConditionedSanaTransformer, DualImageConditionAdapter, encode_condition_images
+from sana_dof import encode_condition_images
 
 
 def parse_args():
@@ -47,19 +45,6 @@ def parse_args():
     parser.add_argument("--guidance_scale", type=float, default=4.5)
     parser.add_argument("--seed", type=int, default=0)
     return parser.parse_args()
-
-
-def load_pipeline(checkpoint, model_id, dtype, pretrained_options):
-    config = json.loads((checkpoint / "adapter_config.json").read_text(encoding="utf-8"))
-    model_id = model_id or config["base_model"]
-    pipe = SanaPipeline.from_pretrained(model_id, torch_dtype=dtype, **pretrained_options).to("cuda")
-    pipe.vae.to(dtype=torch.float32)
-    adapter = DualImageConditionAdapter(pipe.transformer.config.in_channels, config["hidden_channels"])
-    adapter.load_state_dict(load_file(checkpoint / "adapter.safetensors"), strict=True)
-    adapter.to(device="cuda", dtype=dtype).eval()
-    transformer = ConditionedSanaTransformer(pipe.transformer, adapter)
-    pipe.transformer = transformer
-    return pipe, transformer, config
 
 
 def load_condition_pair(record, index, args):

@@ -45,6 +45,11 @@ def load_pipeline(checkpoint, model_id, dtype, pretrained_options):
     model_id = model_id or config["base_model"]
     pipe = SanaPipeline.from_pretrained(model_id, torch_dtype=dtype, **pretrained_options).to("cuda")
     pipe.vae.to(dtype=torch.float32)
+    lora_path = checkpoint / "transformer_lora"
+    if config.get("train_transformer_lora", False) or lora_path.exists():
+        if not lora_path.exists():
+            raise ValueError(f"adapter_config.json requests transformer LoRA, but {lora_path} does not exist.")
+        pipe.load_lora_weights(lora_path)
     adapter = DualImageConditionAdapter(pipe.transformer.config.in_channels, config["hidden_channels"])
     adapter.load_state_dict(load_file(checkpoint / "adapter.safetensors"), strict=True)
     adapter.to(device="cuda", dtype=dtype).eval()

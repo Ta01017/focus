@@ -7,6 +7,8 @@ from pathlib import Path
 
 import torch
 from accelerate import Accelerator
+from peft import LoraConfig, set_peft_model_state_dict
+from peft.utils import get_peft_model_state_dict
 from safetensors.torch import load_file, save_file
 from torch.nn import functional as F
 from torch.utils.data import DataLoader
@@ -25,9 +27,11 @@ from dof_utils import (
 from focus_dataset import DiffSynthFocusDataset
 from sana_dof import ConditionedSanaTransformer, DualImageConditionAdapter, encode_vae_latents
 
+DEFAULT_SANA_LORA_TARGET_MODULES = ["to_k", "to_q", "to_v"]
+
 
 def parse_args():
-    parser = argparse.ArgumentParser(description="Train ordinary SANA + A/B adapter-only DOF fusion.")
+    parser = argparse.ArgumentParser(description="Train ordinary SANA + A/B adapter DOF fusion.")
     parser.add_argument("--model", default="Efficient-Large-Model/Sana_600M_1024px_diffusers")
     add_metadata_args(parser, metadata_required=True)
     add_pretrained_args(parser)
@@ -46,12 +50,85 @@ def parse_args():
     parser.add_argument("--save_steps", type=int, default=1000)
     parser.add_argument("--num_workers", type=int, default=4)
     parser.add_argument("--adapter_hidden_channels", type=int, default=128)
+    parser.add_argument("--train_transformer_lora", action="store_true")
+    parser.add_argument("--lora_rank", type=int, default=8)
+    parser.add_argument("--lora_alpha", type=int, default=8)
+    parser.add_argument("--lora_dropout", type=float, default=0.0)
+    parser.add_argument("--lora_target_modules", default=None)
+    parser.add_argument("--save_transformer_lora", action="store_true", default=True)
     parser.add_argument("--gradient_checkpointing", action="store_true")
     parser.add_argument("--seed", type=int, default=0)
     parser.add_argument("--mixed_precision", choices=("no", "fp16", "bf16"), default="no")
     parser.add_argument("--resume_from_checkpoint", default=None)
     parser.add_argument("--debug_check_finite", action="store_true")
+    parser.add_argument("--debug_log_adapter_stats", action="store_true")
+    parser.add_argument("--overfit_fixed_noise", action="store_true")
+    parser.add_argument("--overfit_timestep_index", type=int, default=None)
+    parser.add_argument("--debug_dump_batch_dir", default=None)
     return parser.parse_args()
+
+
+def parse_lora_target_modules(value):
+    if value is None:
+        return DEFAULT_SANA_LORA_TARGET_MODULES
+    target_modules = [item.strip() for item in value.split(",") if item.strip()]
+    if not target_modules:
+        raise ValueError("--lora_target_modules must contain at least one module name when provided.")
+    return target_modules
+
+
+def print_lora_candidate_modules(transformer):
+    keywords = ("q", "k", "v", "out", "proj")
+    candidates = [
+        name
+        for name, module in transformer.named_modules()
+        if isinstance(module, torch.nn.Linear) and any(keyword in name.lower() for keyword in keywords)
+    ]
+    print("SANA transformer Linear module candidates containing q/k/v/out/proj:")
+    for name in candidates:
+        print(f"  {name}")
+
+
+def validate_lora_target_modules(transformer, target_modules):
+    module_names = [name for name, module in transformer.named_modules() if isinstance(module, torch.nn.Linear)]
+    missing = []
+    for target in target_modules:
+        if not any(name == target or name.endswith(f".{target}") for name in module_names):
+            missing.append(target)
+    if missing:
+        print_lora_candidate_modules(transformer)
+        raise ValueError(f"LoRA target modules were not found in SANA transformer: {missing}")
+
+
+def trainable_parameters(module):
+    return [parameter for parameter in module.parameters() if parameter.requires_grad]
+
+
+def count_parameters(parameters):
+    return sum(parameter.numel() for parameter in parameters)
+
+
+def parameter_norm(parameters):
+    total = 0.0
+    for parameter in parameters:
+        total += parameter.detach().float().square().sum().item()
+    return total**0.5
+
+
+def grad_norm(parameters):
+    total = 0.0
+    for parameter in parameters:
+        if parameter.grad is not None:
+            total += parameter.grad.detach().float().square().sum().item()
+    return total**0.5
+
+
+def dump_debug_batch(batch, directory, global_step):
+    directory = Path(directory)
+    directory.mkdir(parents=True, exist_ok=True)
+    tensors = {key: value.detach().cpu() for key, value in batch.items() if torch.is_tensor(value)}
+    tensors["prompts"] = batch["prompts"]
+    torch.save(tensors, directory / f"batch_step_{global_step:06d}.pt")
 
 
 def save_checkpoint(accelerator, model, optimizer, directory, args, global_step, epoch, step_in_epoch):
@@ -82,11 +159,21 @@ def save_checkpoint(accelerator, model, optimizer, directory, args, global_step,
         "aspect_ratio_tolerance": args.aspect_ratio_tolerance,
         "downscale_if_exceeds_max_pixels": args.downscale_if_exceeds_max_pixels,
         "valid_mask_loss": True,
+        "train_transformer_lora": args.train_transformer_lora,
+        "lora_rank": args.lora_rank,
+        "lora_alpha": args.lora_alpha,
+        "lora_dropout": args.lora_dropout,
+        "lora_target_modules": parse_lora_target_modules(args.lora_target_modules),
         "global_step": global_step,
     }
     (directory / "adapter_config.json").write_text(
         json.dumps(config, indent=2, ensure_ascii=False), encoding="utf-8"
     )
+    if args.train_transformer_lora and args.save_transformer_lora:
+        SanaPipeline.save_lora_weights(
+            save_directory=directory / "transformer_lora",
+            transformer_lora_layers=get_peft_model_state_dict(model.transformer),
+        )
     save_trainer_state(directory, optimizer, global_step, epoch, step_in_epoch)
 
 
@@ -129,6 +216,17 @@ def main():
     pipe.transformer.requires_grad_(False).eval()
     pipe.text_encoder.requires_grad_(False).eval()
     pipe.vae.requires_grad_(False).eval()
+    lora_target_modules = parse_lora_target_modules(args.lora_target_modules)
+    if args.train_transformer_lora:
+        validate_lora_target_modules(pipe.transformer, lora_target_modules)
+        transformer_lora_config = LoraConfig(
+            r=args.lora_rank,
+            lora_alpha=args.lora_alpha,
+            lora_dropout=args.lora_dropout,
+            init_lora_weights="gaussian",
+            target_modules=lora_target_modules,
+        )
+        pipe.transformer.add_adapter(transformer_lora_config)
     adapter = DualImageConditionAdapter(pipe.transformer.config.in_channels, args.adapter_hidden_channels)
     model = ConditionedSanaTransformer(pipe.transformer, adapter)
     if args.gradient_checkpointing:
@@ -137,13 +235,35 @@ def main():
     pipe.vae.to(accelerator.device, dtype=torch.float32)
     pipe.transformer.to(accelerator.device, dtype=weight_dtype)
     adapter.to(accelerator.device, dtype=torch.float32)
-    optimizer = torch.optim.AdamW(adapter.parameters(), lr=args.learning_rate, weight_decay=1e-2)
+    adapter_trainable_parameters = trainable_parameters(adapter)
+    transformer_lora_parameters = trainable_parameters(pipe.transformer) if args.train_transformer_lora else []
+    optimizer = torch.optim.AdamW(
+        adapter_trainable_parameters + transformer_lora_parameters,
+        lr=args.learning_rate,
+        weight_decay=1e-2,
+    )
+    accelerator.print(f"adapter trainable params: {count_parameters(adapter_trainable_parameters):,}")
+    accelerator.print(f"transformer LoRA trainable params: {count_parameters(transformer_lora_parameters):,}")
+    accelerator.print(
+        f"total trainable params: {count_parameters(adapter_trainable_parameters + transformer_lora_parameters):,}"
+    )
 
     output_dir = Path(args.output_dir)
     resume_path = resolve_resume_checkpoint(output_dir, args.resume_from_checkpoint)
     resume_state = {"global_step": 0, "epoch": 0, "step_in_epoch": 0}
     if resume_path is not None:
         adapter.load_state_dict(load_file(resume_path / "adapter.safetensors"), strict=True)
+        if args.train_transformer_lora:
+            lora_path = resume_path / "transformer_lora"
+            if not lora_path.exists():
+                raise ValueError(f"Missing transformer LoRA checkpoint directory: {lora_path}")
+            lora_state_dict = SanaPipeline.lora_state_dict(lora_path)
+            transformer_state_dict = {
+                key.replace("transformer.", ""): value
+                for key, value in lora_state_dict.items()
+                if key.startswith("transformer.")
+            }
+            set_peft_model_state_dict(pipe.transformer, transformer_state_dict, adapter_name="default")
         resume_state = load_trainer_state(resume_path, optimizer)
 
     dataset = DiffSynthFocusDataset(
@@ -186,7 +306,7 @@ def main():
 
     scheduler_timesteps = scheduler.timesteps.to(accelerator.device)
     scheduler_sigmas = scheduler.sigmas.to(accelerator.device)
-    trainable_parameters = list(accelerator.unwrap_model(model).adapter.parameters())
+    fixed_noise_cache = {}
     global_step = int(resume_state["global_step"])
     epoch = int(resume_state["epoch"])
     resume_step = int(resume_state["step_in_epoch"])
@@ -198,6 +318,8 @@ def main():
                 continue
             with accelerator.accumulate(model):
                 with torch.no_grad():
+                    if args.debug_dump_batch_dir and global_step == int(resume_state["global_step"]):
+                        dump_debug_batch(batch, args.debug_dump_batch_dir, global_step)
                     target_latents = encode_vae_latents(
                         pipe.vae, batch["target"].to(accelerator.device, torch.float32)
                     )
@@ -215,10 +337,29 @@ def main():
                         max_sequence_length=300,
                     )
                     prompt_embeds = prompt_embeds.to(weight_dtype)
-                    noise = torch.randn_like(target_latents)
-                    indices = torch.randint(
-                        0, scheduler.config.num_train_timesteps, (target_latents.shape[0],), device=accelerator.device
-                    )
+                    if args.overfit_fixed_noise:
+                        cache_key = (tuple(target_latents.shape), str(accelerator.device))
+                        if cache_key not in fixed_noise_cache:
+                            fixed_noise_cache[cache_key] = torch.randn_like(target_latents)
+                        noise = fixed_noise_cache[cache_key]
+                    else:
+                        noise = torch.randn_like(target_latents)
+                    if args.overfit_timestep_index is None:
+                        indices = torch.randint(
+                            0,
+                            scheduler.config.num_train_timesteps,
+                            (target_latents.shape[0],),
+                            device=accelerator.device,
+                        )
+                    else:
+                        if args.overfit_timestep_index < 0 or args.overfit_timestep_index >= scheduler.config.num_train_timesteps:
+                            raise ValueError("--overfit_timestep_index is outside scheduler train timestep range.")
+                        indices = torch.full(
+                            (target_latents.shape[0],),
+                            args.overfit_timestep_index,
+                            device=accelerator.device,
+                            dtype=torch.long,
+                        )
                     timesteps = scheduler_timesteps[indices]
                     sigmas = scheduler_sigmas[indices].view(-1, 1, 1, 1).to(target_latents.dtype)
                     noisy_latents = (1 - sigmas) * target_latents + sigmas * noise
@@ -257,7 +398,16 @@ def main():
                     )
                 accelerator.backward(loss)
                 if accelerator.sync_gradients:
-                    accelerator.clip_grad_norm_(trainable_parameters, 1.0)
+                    if args.debug_log_adapter_stats and accelerator.is_main_process:
+                        print(
+                            "trainable_stats "
+                            f"step={global_step} "
+                            f"adapter_grad_norm={grad_norm(adapter_trainable_parameters):.6f} "
+                            f"adapter_param_norm={parameter_norm(adapter_trainable_parameters):.6f} "
+                            f"transformer_lora_grad_norm={grad_norm(transformer_lora_parameters):.6f} "
+                            f"transformer_lora_param_norm={parameter_norm(transformer_lora_parameters):.6f}"
+                        )
+                    accelerator.clip_grad_norm_(adapter_trainable_parameters + transformer_lora_parameters, 1.0)
                 optimizer.step()
                 optimizer.zero_grad(set_to_none=True)
 

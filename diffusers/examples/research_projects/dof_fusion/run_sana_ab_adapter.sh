@@ -38,6 +38,11 @@ SAVE_STEPS=${SAVE_STEPS:-500}
 MIXED_PRECISION=${MIXED_PRECISION:-no}
 LEARNING_RATE=${LEARNING_RATE:-1e-5}
 ADAPTER_HIDDEN_CHANNELS=${ADAPTER_HIDDEN_CHANNELS:-128}
+TRAIN_TRANSFORMER_LORA=${TRAIN_TRANSFORMER_LORA:-0}
+LORA_RANK=${LORA_RANK:-8}
+LORA_ALPHA=${LORA_ALPHA:-8}
+LORA_DROPOUT=${LORA_DROPOUT:-0.0}
+LORA_TARGET_MODULES=${LORA_TARGET_MODULES:-}
 MAX_PIXELS=${MAX_PIXELS:-1048576}
 DOWNSCALE_IF_EXCEEDS_MAX_PIXELS=${DOWNSCALE_IF_EXCEEDS_MAX_PIXELS:-1}
 SIZE_DIVISOR=${SIZE_DIVISOR:-32}
@@ -83,6 +88,19 @@ if [[ -n "${TRAIN_MAX_SAMPLES}" ]]; then
   sample_args+=(--max_samples "${TRAIN_MAX_SAMPLES}")
 fi
 
+lora_args=()
+if [[ "${TRAIN_TRANSFORMER_LORA}" == "1" ]]; then
+  lora_args+=(
+    --train_transformer_lora
+    --lora_rank "${LORA_RANK}"
+    --lora_alpha "${LORA_ALPHA}"
+    --lora_dropout "${LORA_DROPOUT}"
+  )
+  if [[ -n "${LORA_TARGET_MODULES}" ]]; then
+    lora_args+=(--lora_target_modules "${LORA_TARGET_MODULES}")
+  fi
+fi
+
 run_train() {
   accelerate launch \
     --num_processes "${NUM_PROCESSES}" \
@@ -102,6 +120,7 @@ run_train() {
     --adapter_hidden_channels "${ADAPTER_HIDDEN_CHANNELS}" \
     --mixed_precision "${MIXED_PRECISION}" \
     --debug_check_finite \
+    "${lora_args[@]}" \
     "${sample_args[@]}" \
     "${pretrained_args[@]}" \
     "${train_size_args[@]}"
