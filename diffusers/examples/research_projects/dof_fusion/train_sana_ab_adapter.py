@@ -1,0 +1,289 @@
+#!/usr/bin/env python
+
+import argparse
+import json
+import random
+from pathlib import Path
+
+import torch
+from accelerate import Accelerator
+from safetensors.torch import load_file, save_file
+from torch.nn import functional as F
+from torch.utils.data import DataLoader
+
+from diffusers import FlowMatchEulerDiscreteScheduler, SanaPipeline
+
+from dof_utils import (
+    add_metadata_args,
+    add_pretrained_args,
+    load_trainer_state,
+    paired_preprocess,
+    pretrained_kwargs,
+    resolve_resume_checkpoint,
+    save_trainer_state,
+)
+from focus_dataset import DiffSynthFocusDataset
+from sana_dof import ConditionedSanaTransformer, DualImageConditionAdapter, encode_vae_latents
+
+
+def parse_args():
+    parser = argparse.ArgumentParser(description="Train ordinary SANA + A/B adapter-only DOF fusion.")
+    parser.add_argument("--model", default="Efficient-Large-Model/Sana_600M_1024px_diffusers")
+    add_metadata_args(parser, metadata_required=True)
+    add_pretrained_args(parser)
+    parser.add_argument("--dataset_repeat", type=int, default=1)
+    parser.add_argument("--output_dir", required=True)
+    parser.add_argument("--prompt", default="a photorealistic all-in-focus photograph")
+    parser.add_argument("--resolution", type=int, default=None)
+    parser.add_argument("--max_pixels", type=int, default=None)
+    parser.add_argument("--size_divisor", type=int, default=32)
+    parser.add_argument("--aspect_ratio_tolerance", type=float, default=0.01)
+    parser.add_argument("--downscale_if_exceeds_max_pixels", action="store_true")
+    parser.add_argument("--batch_size", type=int, default=1)
+    parser.add_argument("--gradient_accumulation_steps", type=int, default=1)
+    parser.add_argument("--learning_rate", type=float, default=1e-5)
+    parser.add_argument("--max_train_steps", type=int, default=20000)
+    parser.add_argument("--save_steps", type=int, default=1000)
+    parser.add_argument("--num_workers", type=int, default=4)
+    parser.add_argument("--adapter_hidden_channels", type=int, default=128)
+    parser.add_argument("--gradient_checkpointing", action="store_true")
+    parser.add_argument("--seed", type=int, default=0)
+    parser.add_argument("--mixed_precision", choices=("no", "fp16", "bf16"), default="bf16")
+    parser.add_argument("--resume_from_checkpoint", default=None)
+    parser.add_argument("--debug_check_finite", action="store_true")
+    return parser.parse_args()
+
+
+def save_checkpoint(accelerator, model, optimizer, directory, args, global_step, epoch, step_in_epoch):
+    accelerator.wait_for_everyone()
+    if not accelerator.is_main_process:
+        return
+    model = accelerator.unwrap_model(model)
+    directory.mkdir(parents=True, exist_ok=True)
+    save_file(
+        {key: value.detach().cpu().contiguous() for key, value in model.adapter.state_dict().items()},
+        directory / "adapter.safetensors",
+    )
+    config = {
+        "base_model": args.model,
+        "model_type": "sana_ab_adapter_dof",
+        "target_key": args.target_key,
+        "edit_key": args.edit_key,
+        "prompt_key": args.prompt_key,
+        "cond_format": "edit_image[A,B]",
+        "use_controlnet": False,
+        "use_focus_maps": False,
+        "latent_channels": model.transformer.config.in_channels,
+        "hidden_channels": args.adapter_hidden_channels,
+        "resolution": args.resolution,
+        "dynamic_resolution": args.resolution is None,
+        "max_pixels": args.max_pixels,
+        "size_divisor": args.size_divisor,
+        "aspect_ratio_tolerance": args.aspect_ratio_tolerance,
+        "downscale_if_exceeds_max_pixels": args.downscale_if_exceeds_max_pixels,
+        "valid_mask_loss": True,
+        "global_step": global_step,
+    }
+    (directory / "adapter_config.json").write_text(
+        json.dumps(config, indent=2, ensure_ascii=False), encoding="utf-8"
+    )
+    save_trainer_state(directory, optimizer, global_step, epoch, step_in_epoch)
+
+
+def check_finite(global_step, tensors):
+    for name, tensor in tensors.items():
+        if tensor is None:
+            continue
+        finite = torch.isfinite(tensor)
+        if finite.all():
+            continue
+        nan_count = torch.isnan(tensor).sum().item()
+        inf_count = torch.isinf(tensor).sum().item()
+        print(f"Non-finite tensor at step={global_step}: {name} nan_count={nan_count} inf_count={inf_count}")
+        raise RuntimeError(f"Non-finite values detected in {name}.")
+
+
+def main():
+    args = parse_args()
+    if args.resolution is not None and args.resolution % args.size_divisor:
+        raise ValueError("--resolution must be divisible by --size_divisor.")
+    if args.resolution is None and args.batch_size != 1:
+        raise ValueError("Dynamic-resolution training requires --batch_size 1; use gradient accumulation.")
+
+    accelerator = Accelerator(
+        gradient_accumulation_steps=args.gradient_accumulation_steps,
+        mixed_precision=args.mixed_precision,
+    )
+    torch.manual_seed(args.seed)
+    random.seed(args.seed)
+    weight_dtype = torch.float32
+    if accelerator.device.type == "cuda" and args.mixed_precision == "bf16":
+        weight_dtype = torch.bfloat16
+    elif accelerator.device.type == "cuda" and args.mixed_precision == "fp16":
+        weight_dtype = torch.float16
+
+    pipe = SanaPipeline.from_pretrained(args.model, torch_dtype=weight_dtype, **pretrained_kwargs(args))
+    scheduler = FlowMatchEulerDiscreteScheduler.from_pretrained(
+        args.model, subfolder="scheduler", **pretrained_kwargs(args)
+    )
+    pipe.transformer.requires_grad_(False).eval()
+    pipe.text_encoder.requires_grad_(False).eval()
+    pipe.vae.requires_grad_(False).eval()
+    adapter = DualImageConditionAdapter(pipe.transformer.config.in_channels, args.adapter_hidden_channels)
+    model = ConditionedSanaTransformer(pipe.transformer, adapter)
+    if args.gradient_checkpointing:
+        pipe.transformer.enable_gradient_checkpointing()
+    pipe.text_encoder.to(accelerator.device, dtype=weight_dtype)
+    pipe.vae.to(accelerator.device, dtype=torch.float32)
+    pipe.transformer.to(accelerator.device, dtype=weight_dtype)
+    adapter.to(accelerator.device, dtype=torch.float32)
+    optimizer = torch.optim.AdamW(adapter.parameters(), lr=args.learning_rate, weight_decay=1e-2)
+
+    output_dir = Path(args.output_dir)
+    resume_path = resolve_resume_checkpoint(output_dir, args.resume_from_checkpoint)
+    resume_state = {"global_step": 0, "epoch": 0, "step_in_epoch": 0}
+    if resume_path is not None:
+        adapter.load_state_dict(load_file(resume_path / "adapter.safetensors"), strict=True)
+        resume_state = load_trainer_state(resume_path, optimizer)
+
+    dataset = DiffSynthFocusDataset(
+        metadata_path=args.dataset_metadata_path,
+        base_path=args.dataset_base_path,
+        target_key=args.target_key,
+        edit_key=args.edit_key,
+        repeat=args.dataset_repeat,
+        min_edit_images=2,
+        use_focus_maps=False,
+        default_prompt=args.prompt,
+        prompt_key=args.prompt_key,
+        start_index=args.start_index,
+        max_samples=args.max_samples,
+    )
+
+    def collate_fn(samples):
+        return paired_preprocess(
+            samples,
+            args.resolution,
+            pipe.image_processor,
+            training=True,
+            max_pixels=args.max_pixels,
+            size_divisor=args.size_divisor,
+            aspect_ratio_tolerance=args.aspect_ratio_tolerance,
+            downscale_if_exceeds_max_pixels=args.downscale_if_exceeds_max_pixels,
+        )
+
+    dataloader = DataLoader(
+        dataset,
+        batch_size=args.batch_size,
+        shuffle=True,
+        num_workers=args.num_workers,
+        collate_fn=collate_fn,
+        pin_memory=True,
+    )
+    model, optimizer, dataloader = accelerator.prepare(model, optimizer, dataloader)
+    if accelerator.is_main_process:
+        output_dir.mkdir(parents=True, exist_ok=True)
+
+    scheduler_timesteps = scheduler.timesteps.to(accelerator.device)
+    scheduler_sigmas = scheduler.sigmas.to(accelerator.device)
+    trainable_parameters = list(accelerator.unwrap_model(model).adapter.parameters())
+    global_step = int(resume_state["global_step"])
+    epoch = int(resume_state["epoch"])
+    resume_step = int(resume_state["step_in_epoch"])
+    while global_step < args.max_train_steps:
+        if hasattr(dataloader.sampler, "set_epoch"):
+            dataloader.sampler.set_epoch(epoch)
+        for step, batch in enumerate(dataloader):
+            if epoch == int(resume_state["epoch"]) and step < resume_step:
+                continue
+            with accelerator.accumulate(model):
+                with torch.no_grad():
+                    target_latents = encode_vae_latents(
+                        pipe.vae, batch["target"].to(accelerator.device, torch.float32)
+                    )
+                    cond_a_latents = encode_vae_latents(
+                        pipe.vae, batch["cond_a"].to(accelerator.device, torch.float32)
+                    )
+                    cond_b_latents = encode_vae_latents(
+                        pipe.vae, batch["cond_b"].to(accelerator.device, torch.float32)
+                    )
+                    prompt_embeds, prompt_mask, _, _ = pipe.encode_prompt(
+                        batch["prompts"],
+                        do_classifier_free_guidance=False,
+                        device=accelerator.device,
+                        clean_caption=False,
+                        max_sequence_length=300,
+                    )
+                    prompt_embeds = prompt_embeds.to(weight_dtype)
+                    noise = torch.randn_like(target_latents)
+                    indices = torch.randint(
+                        0, scheduler.config.num_train_timesteps, (target_latents.shape[0],), device=accelerator.device
+                    )
+                    timesteps = scheduler_timesteps[indices]
+                    sigmas = scheduler_sigmas[indices].view(-1, 1, 1, 1).to(target_latents.dtype)
+                    noisy_latents = (1 - sigmas) * target_latents + sigmas * noise
+                    velocity_target = noise - target_latents
+
+                prediction = model(
+                    noisy_latents.to(weight_dtype),
+                    encoder_hidden_states=prompt_embeds,
+                    encoder_attention_mask=prompt_mask,
+                    timestep=timesteps,
+                    cond_a_latents=cond_a_latents,
+                    cond_b_latents=cond_b_latents,
+                    return_dict=False,
+                )[0]
+                error = prediction.float() - velocity_target.float()
+                valid_mask = F.interpolate(
+                    batch["valid_mask"].to(accelerator.device), size=error.shape[-2:], mode="nearest"
+                )
+                denominator = (valid_mask.sum() * error.shape[1]).clamp_min(1)
+                flow_mse = (error.square() * valid_mask).sum() / denominator
+                flow_l1 = (error.abs() * valid_mask).sum() / denominator
+                loss = flow_mse + 0.1 * flow_l1
+                if args.debug_check_finite:
+                    check_finite(
+                        global_step,
+                        {
+                            "target_latents": target_latents,
+                            "cond_a_latents": cond_a_latents,
+                            "cond_b_latents": cond_b_latents,
+                            "noisy_latents": noisy_latents,
+                            "velocity_target": velocity_target,
+                            "prediction": prediction,
+                            "error": error,
+                            "loss": loss,
+                        },
+                    )
+                accelerator.backward(loss)
+                if accelerator.sync_gradients:
+                    accelerator.clip_grad_norm_(trainable_parameters, 1.0)
+                optimizer.step()
+                optimizer.zero_grad(set_to_none=True)
+
+            if accelerator.sync_gradients:
+                global_step += 1
+                if accelerator.is_main_process and global_step % 10 == 0:
+                    print(f"step={global_step} loss={loss.detach().item():.6f}")
+                if global_step % args.save_steps == 0 or global_step == args.max_train_steps:
+                    save_checkpoint(
+                        accelerator,
+                        model,
+                        optimizer,
+                        output_dir / f"checkpoint-{global_step}",
+                        args,
+                        global_step,
+                        epoch,
+                        step + 1,
+                    )
+                if global_step >= args.max_train_steps:
+                    break
+        epoch += 1
+        resume_step = 0
+
+    save_checkpoint(accelerator, model, optimizer, output_dir, args, global_step, epoch, 0)
+    accelerator.wait_for_everyone()
+
+
+if __name__ == "__main__":
+    main()

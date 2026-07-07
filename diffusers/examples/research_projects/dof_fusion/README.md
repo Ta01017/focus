@@ -50,6 +50,12 @@ python -m pip install -e ".[training]"
 ```
 
 `-e` 表示 editable install。后续修改本仓库中的 Diffusers 或景深融合代码后，无需反复重新安装。
+如果代码已经迁移到 `D:\work\vivo\focus\focus\diffusers`，在 WSL 中对应路径通常是：
+
+```bash
+cd /mnt/d/work/vivo/focus/focus/diffusers
+python -m pip install -e ".[training]"
+```
 
 ### 4. 安装本实验额外依赖
 
@@ -117,12 +123,13 @@ bash examples/research_projects/dof_fusion/run_sana_sprint.sh
 
 ## 方案总览
 
-当前共有 6 套可训练方案：
+当前共有 7 套可训练方案：
 
 | 方案 | 训练内容 | 基模是否冻结 | 默认推理 |
 | --- | --- | --- | --- |
 | FLUX.2 Klein LoRA | Transformer LoRA | 是 | 4 步 |
 | FLUX.2 Klein + 轻量 ControlNet | 自定义 focus residual 分支 | 是 | 4 步 |
+| 普通 SANA A/B Adapter | 外置双图卷积 Adapter，不用 focus / ControlNet | 是 | 20 步 |
 | SANA-Sprint A/B Adapter | 外置双图卷积 Adapter | 是 | 1 步 |
 | SANA-Sprint + ControlNet | A/B Adapter + 完整 ControlNet | 是 | 1 步 |
 | 普通 SANA + ControlNet | A/B Adapter + 完整 ControlNet | 是 | 20 步 |
@@ -134,10 +141,11 @@ bash examples/research_projects/dof_fusion/run_sana_sprint.sh
 
 1. `train_flux2_klein.py` / `infer_flux2_klein.py`
 2. `train_flux2_klein_controlnet.py` / `infer_flux2_klein_controlnet.py`
-3. `train_sana_sprint.py` / `infer_sana_sprint.py`
-4. `train_sana_sprint_controlnet.py` / `infer_sana_sprint_controlnet.py`
-5. `train_sana_controlnet.py` / `infer_sana_controlnet.py`
-6. `train_sana_sprint_img2img.py` / `infer_sana_sprint_img2img.py`
+3. `train_sana_ab_adapter.py` / `infer_sana_ab_adapter.py`
+4. `train_sana_sprint.py` / `infer_sana_sprint.py`
+5. `train_sana_sprint_controlnet.py` / `infer_sana_sprint_controlnet.py`
+6. `train_sana_controlnet.py` / `infer_sana_controlnet.py`
+7. `train_sana_sprint_img2img.py` / `infer_sana_sprint_img2img.py`
 
 普通 SANA ControlNet 和 Sprint img2img 的补充说明见
 `README_sana_controlnet_and_img2img.md`，Sprint ControlNet 的补充说明见
@@ -186,14 +194,43 @@ E1～E4 完成并形成可比较结果后，再决定是否运行 ControlNet 和
 
 建议不要一开始同时验证多图注入、focus map 和 ControlNet。后续顺序如下：
 
-1. **SANA-Sprint A/B Adapter**：最符合小模型、one-step 和后续端侧部署目标。
-2. **FLUX.2 Klein LoRA**：作为原生多图条件下的质量上限和数据有效性基准。
-3. **SANA-Sprint img2img**：当 one-step 方案出现结构变化或纹理重绘时，用 A 或初步融合结果初始化。
-4. **普通 SANA + ControlNet**：focus map 稳定后，先验证多步 ControlNet 是否有效。
-5. **SANA-Sprint + ControlNet**：普通 ControlNet 有收益后，再尝试迁移到 one-step。
-6. **FLUX.2 Klein + 轻量 ControlNet**：自定义研究路线，建议最后验证。
+1. **普通 SANA A/B Adapter**：不用 focus、不用 ControlNet，只判断基础 SANA adapter 能否 overfit `[A, B] → GT`。
+2. **SANA-Sprint A/B Adapter**：最符合小模型、one-step 和后续端侧部署目标。
+3. **FLUX.2 Klein LoRA**：作为原生多图条件下的质量上限和数据有效性基准。
+4. **SANA-Sprint img2img**：当 one-step 方案出现结构变化或纹理重绘时，用 A 或初步融合结果初始化。
+5. **普通 SANA + ControlNet**：focus map 稳定后，先验证多步 ControlNet 是否有效。
+6. **SANA-Sprint + ControlNet**：普通 ControlNet 有收益后，再尝试迁移到 one-step。
+7. **FLUX.2 Klein + 轻量 ControlNet**：自定义研究路线，建议最后验证。
 
 E1 只使用 `[A, B] → GT` 且不开 focus loss；E2/E3 再逐项引入 focus，避免一次改变多个变量。
+
+### 普通 SANA A/B Adapter-only baseline
+
+`run_sana_ab_adapter.sh` 是 ordinary SANA + A/B adapter-only baseline：
+
+- 基模：`Efficient-Large-Model/Sana_600M_1024px_diffusers`
+- 输入：只读 `edit_image[0] = A` 和 `edit_image[1] = B`
+- 监督：metadata 中的 `image` 字段
+- 不使用 focus map，不使用 ControlNet
+- 冻结 SANA transformer、text encoder、VAE，只训练外置 A/B adapter
+- 使用普通 SANA flow matching velocity loss，并用 `valid_mask` 屏蔽 padding
+
+这个 baseline 的价值是快速判断“普通 SANA + 最小双图 adapter”是否能 overfit A/B 到 GT。推荐先跑 tiny1 和
+tiny16 overfit，再跑完整训练：
+
+```bash
+# tiny1 overfit
+MODE=train TRAIN_MAX_SAMPLES=1 MAX_TRAIN_STEPS=200 SAVE_STEPS=100 \
+bash examples/research_projects/dof_fusion/run_sana_ab_adapter.sh
+
+# tiny16 overfit
+MODE=train TRAIN_MAX_SAMPLES=16 MAX_TRAIN_STEPS=1000 SAVE_STEPS=250 \
+bash examples/research_projects/dof_fusion/run_sana_ab_adapter.sh
+```
+
+尺寸处理与其他 DOF 路线一致：`MAX_PIXELS` 是最大像素上限，不会强制把图缩放到固定面积；默认不裁边、不改
+宽高比例。只有当设置 `DOWNSCALE_IF_EXCEEDS_MAX_PIXELS=1` 且 A 图超过上限时，才等比例缩小到上限内，
+然后右侧/底部 padding 到 `SIZE_DIVISOR` 的倍数，推理输出默认恢复到 A 的原始尺寸。
 
 ## 数据检查、smoke test 与评测
 
