@@ -100,6 +100,7 @@ run_train() {
     --save_steps "${SAVE_STEPS}" \
     --num_workers "${NUM_WORKERS}" \
     --adapter_hidden_channels "${ADAPTER_HIDDEN_CHANNELS}" \
+    --mixed_precision "${MIXED_PRECISION}" \
     --debug_check_finite \
     "${sample_args[@]}" \
     "${pretrained_args[@]}" \

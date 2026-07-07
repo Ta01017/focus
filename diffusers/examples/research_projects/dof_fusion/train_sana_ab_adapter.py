@@ -48,7 +48,7 @@ def parse_args():
     parser.add_argument("--adapter_hidden_channels", type=int, default=128)
     parser.add_argument("--gradient_checkpointing", action="store_true")
     parser.add_argument("--seed", type=int, default=0)
-    parser.add_argument("--mixed_precision", choices=("no", "fp16", "bf16"), default="bf16")
+    parser.add_argument("--mixed_precision", choices=("no", "fp16", "bf16"), default="no")
     parser.add_argument("--resume_from_checkpoint", default=None)
     parser.add_argument("--debug_check_finite", action="store_true")
     return parser.parse_args()
