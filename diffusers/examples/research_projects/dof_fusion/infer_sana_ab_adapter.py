@@ -143,6 +143,10 @@ def generate_sana_img2img_sliced(
     init_timestep = max(init_timestep, 1)
     t_start = max(num_inference_steps - init_timestep, 0)
     sliced_timesteps = timesteps[t_start:]
+    scheduler_has_set_begin_index = hasattr(pipe.scheduler, "set_begin_index")
+    begin_index_value = t_start * pipe.scheduler.order
+    if scheduler_has_set_begin_index:
+        pipe.scheduler.set_begin_index(begin_index_value)
     if not hasattr(pipe.scheduler, "sigmas"):
         raise NotImplementedError("Sliced SANA img2img requires scheduler.sigmas.")
     sigma = pipe.scheduler.sigmas[t_start].to(device=device, dtype=torch.float32).reshape(1, 1, 1, 1)
@@ -182,6 +186,9 @@ def generate_sana_img2img_sliced(
         "init_timestep": init_timestep,
         "t_start": t_start,
         "actual_num_denoise_steps": len(sliced_timesteps),
+        "scheduler_has_set_begin_index": scheduler_has_set_begin_index,
+        "scheduler_order": pipe.scheduler.order,
+        "begin_index_value": begin_index_value,
         "selected_sigma": float(sigma.flatten()[0].detach().cpu()),
         "timesteps_first": float(timesteps[0].detach().cpu()),
         "timesteps_last": float(timesteps[-1].detach().cpu()),
