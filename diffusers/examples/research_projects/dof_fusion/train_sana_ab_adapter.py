@@ -51,6 +51,9 @@ def parse_args():
     parser.add_argument("--log_steps", type=int, default=10)
     parser.add_argument("--num_workers", type=int, default=4)
     parser.add_argument("--adapter_hidden_channels", type=int, default=128)
+    parser.add_argument("--init_from_a_latent", action="store_true")
+    parser.add_argument("--a_latent_noise_strength", type=float, default=1.0)
+    parser.add_argument("--prediction_target", choices=("velocity", "x0"), default="velocity")
     parser.add_argument("--train_transformer_lora", action="store_true")
     parser.add_argument("--lora_rank", type=int, default=8)
     parser.add_argument("--lora_alpha", type=int, default=8)
@@ -160,6 +163,9 @@ def save_checkpoint(accelerator, model, optimizer, directory, args, global_step,
         "aspect_ratio_tolerance": args.aspect_ratio_tolerance,
         "downscale_if_exceeds_max_pixels": args.downscale_if_exceeds_max_pixels,
         "valid_mask_loss": True,
+        "init_from_a_latent": args.init_from_a_latent,
+        "a_latent_noise_strength": args.a_latent_noise_strength,
+        "prediction_target": args.prediction_target,
         "train_transformer_lora": args.train_transformer_lora,
         "lora_rank": args.lora_rank,
         "lora_alpha": args.lora_alpha,
@@ -202,6 +208,8 @@ def main():
         raise ValueError("Dynamic-resolution training requires --batch_size 1; use gradient accumulation.")
     if args.log_steps < 1:
         raise ValueError("--log_steps must be at least 1.")
+    if args.a_latent_noise_strength < 0:
+        raise ValueError("--a_latent_noise_strength must be non-negative.")
 
     accelerator = Accelerator(
         gradient_accumulation_steps=args.gradient_accumulation_steps,
@@ -257,6 +265,9 @@ def main():
         f"total trainable params: {count_parameters(adapter_trainable_parameters + transformer_lora_parameters):,}",
         flush=True,
     )
+    accelerator.print(f"[INIT_FROM_A_LATENT] {int(args.init_from_a_latent)}", flush=True)
+    accelerator.print(f"[A_LATENT_NOISE_STRENGTH] {args.a_latent_noise_strength}", flush=True)
+    accelerator.print(f"[PREDICTION_TARGET] {args.prediction_target}", flush=True)
 
     output_dir = Path(args.output_dir)
     resume_path = resolve_resume_checkpoint(output_dir, args.resume_from_checkpoint)
@@ -372,8 +383,15 @@ def main():
                         )
                     timesteps = scheduler_timesteps[indices]
                     sigmas = scheduler_sigmas[indices].view(-1, 1, 1, 1).to(target_latents.dtype)
-                    noisy_latents = (1 - sigmas) * target_latents + sigmas * noise
-                    velocity_target = noise - target_latents
+                    if args.init_from_a_latent:
+                        init_sigmas = (sigmas * args.a_latent_noise_strength).clamp(0, 1)
+                        noisy_latents = (1 - init_sigmas) * cond_a_latents + init_sigmas * noise
+                    else:
+                        noisy_latents = (1 - sigmas) * target_latents + sigmas * noise
+                    if args.prediction_target == "velocity":
+                        loss_target = noise - target_latents
+                    else:
+                        loss_target = target_latents
 
                 prediction = model(
                     noisy_latents.to(weight_dtype),
@@ -384,14 +402,14 @@ def main():
                     cond_b_latents=cond_b_latents,
                     return_dict=False,
                 )[0]
-                error = prediction.float() - velocity_target.float()
+                error = prediction.float() - loss_target.float()
                 valid_mask = F.interpolate(
                     batch["valid_mask"].to(accelerator.device), size=error.shape[-2:], mode="nearest"
                 )
                 denominator = (valid_mask.sum() * error.shape[1]).clamp_min(1)
                 flow_mse = (error.square() * valid_mask).sum() / denominator
                 flow_l1 = (error.abs() * valid_mask).sum() / denominator
-                loss = flow_mse + 0.1 * flow_l1
+                loss = flow_mse if args.init_from_a_latent else flow_mse + 0.1 * flow_l1
                 if args.debug_check_finite:
                     check_finite(
                         global_step,
@@ -400,7 +418,7 @@ def main():
                             "cond_a_latents": cond_a_latents,
                             "cond_b_latents": cond_b_latents,
                             "noisy_latents": noisy_latents,
-                            "velocity_target": velocity_target,
+                            "loss_target": loss_target,
                             "prediction": prediction,
                             "error": error,
                             "loss": loss,

@@ -17,7 +17,7 @@ from dof_utils import (
     sample_prompt,
     select_records,
 )
-from infer_sana_ab_adapter import load_pipeline
+from infer_sana_ab_adapter import load_pipeline, prepare_a_latent_init
 from metadata import load_metadata, require_keys, resolve_data_path
 from sana_dof import encode_condition_images
 
@@ -44,6 +44,9 @@ def parse_args():
     parser.add_argument("--steps", type=int, default=20)
     parser.add_argument("--guidance_scale", type=float, default=4.5)
     parser.add_argument("--seed", type=int, default=0)
+    parser.add_argument("--use_a_latent_init", action="store_true")
+    parser.add_argument("--strength", type=float, default=0.6)
+    parser.add_argument("--zero_condition_images", action="store_true")
     return parser.parse_args()
 
 
@@ -72,6 +75,9 @@ def main():
 
     dtype = torch.bfloat16 if torch.cuda.is_bf16_supported() else torch.float16
     pipe, transformer, _ = load_pipeline(Path(args.checkpoint), args.model, dtype, pretrained_kwargs(args))
+    print(f"[USE_A_LATENT_INIT] {int(args.use_a_latent_init)}", flush=True)
+    print(f"[STRENGTH] {args.strength}", flush=True)
+    print(f"[ZERO_CONDITION_IMAGES] {int(args.zero_condition_images)}", flush=True)
     records = load_metadata(args.dataset_metadata_path)
     items = select_records(records, args.start_index, args.max_samples)
     output_dir = Path(args.output_dir)
@@ -97,11 +103,18 @@ def main():
                 args.downscale_if_exceeds_max_pixels,
             )
             canvas_width, canvas_height = size_info["canvas_size"]
+            condition_a = Image.new("RGB", prepared["a"].size, (0, 0, 0)) if args.zero_condition_images else prepared["a"]
+            condition_b = Image.new("RGB", prepared["b"].size, (0, 0, 0)) if args.zero_condition_images else prepared["b"]
             cond_a, cond_b = encode_condition_images(
-                pipe, prepared["a"], prepared["b"], canvas_height, canvas_width, torch.device("cuda")
+                pipe, condition_a, condition_b, canvas_height, canvas_width, torch.device("cuda")
             )
             seed = int(record.get(args.seed_key, args.seed + index))
             generator = torch.Generator(device="cuda").manual_seed(seed)
+            latents = None
+            if args.use_a_latent_init:
+                latents = prepare_a_latent_init(
+                    pipe, prepared["a"], canvas_height, canvas_width, args.strength, generator, torch.device("cuda")
+                )
             with transformer.use_condition(cond_a, cond_b):
                 image = pipe(
                     prompt=sample_prompt(record, args.prompt_key, args.prompt),
@@ -110,6 +123,7 @@ def main():
                     num_inference_steps=args.steps,
                     guidance_scale=args.guidance_scale,
                     generator=generator,
+                    latents=latents,
                     use_resolution_binning=False,
                 ).images[0]
             image = restore_output_size(image, size_info, args.restore_to_original_size)

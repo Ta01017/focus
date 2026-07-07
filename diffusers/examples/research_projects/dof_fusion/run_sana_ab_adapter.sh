@@ -39,6 +39,9 @@ LOG_STEPS=${LOG_STEPS:-10}
 MIXED_PRECISION=${MIXED_PRECISION:-no}
 LEARNING_RATE=${LEARNING_RATE:-1e-5}
 ADAPTER_HIDDEN_CHANNELS=${ADAPTER_HIDDEN_CHANNELS:-128}
+INIT_FROM_A_LATENT=${INIT_FROM_A_LATENT:-0}
+A_LATENT_NOISE_STRENGTH=${A_LATENT_NOISE_STRENGTH:-1.0}
+PREDICTION_TARGET=${PREDICTION_TARGET:-velocity}
 TRAIN_TRANSFORMER_LORA=${TRAIN_TRANSFORMER_LORA:-0}
 LORA_RANK=${LORA_RANK:-8}
 LORA_ALPHA=${LORA_ALPHA:-8}
@@ -53,6 +56,9 @@ TRAIN_START_INDEX=${TRAIN_START_INDEX:-0}
 TRAIN_MAX_SAMPLES=${TRAIN_MAX_SAMPLES:-}
 INFER_STEPS=${INFER_STEPS:-20}
 GUIDANCE_SCALE=${GUIDANCE_SCALE:-4.5}
+USE_A_LATENT_INIT=${USE_A_LATENT_INIT:-0}
+STRENGTH=${STRENGTH:-0.6}
+ZERO_CONDITION_IMAGES=${ZERO_CONDITION_IMAGES:-0}
 SEED=${SEED:-0}
 RESTORE_TO_ORIGINAL_SIZE=${RESTORE_TO_ORIGINAL_SIZE:-1}
 IMAGE_A=${IMAGE_A:-${TRAIN_BASE}/a.png}
@@ -90,6 +96,9 @@ if [[ -n "${TRAIN_MAX_SAMPLES}" ]]; then
 fi
 
 run_train() {
+  echo "[INIT_FROM_A_LATENT] ${INIT_FROM_A_LATENT}"
+  echo "[A_LATENT_NOISE_STRENGTH] ${A_LATENT_NOISE_STRENGTH}"
+  echo "[PREDICTION_TARGET] ${PREDICTION_TARGET}"
   echo "[TRAIN_TRANSFORMER_LORA] ${TRAIN_TRANSFORMER_LORA}"
   echo "[LORA_RANK] ${LORA_RANK}"
   echo "[LORA_ALPHA] ${LORA_ALPHA}"
@@ -102,6 +111,13 @@ run_train() {
     lora_args+=(--lora_alpha "${LORA_ALPHA}")
     lora_args+=(--lora_dropout "${LORA_DROPOUT}")
     lora_args+=(--lora_target_modules "${LORA_TARGET_MODULES}")
+  fi
+
+  init_args=()
+  if [[ "${INIT_FROM_A_LATENT}" == "1" ]]; then
+    init_args+=(--init_from_a_latent)
+    init_args+=(--a_latent_noise_strength "${A_LATENT_NOISE_STRENGTH}")
+    init_args+=(--prediction_target "${PREDICTION_TARGET}")
   fi
 
   accelerate launch \
@@ -124,12 +140,25 @@ run_train() {
     --mixed_precision "${MIXED_PRECISION}" \
     --debug_check_finite \
     "${lora_args[@]}" \
+    "${init_args[@]}" \
     "${sample_args[@]}" \
     "${pretrained_args[@]}" \
     "${train_size_args[@]}"
 }
 
 run_infer() {
+  echo "[USE_A_LATENT_INIT] ${USE_A_LATENT_INIT}"
+  echo "[STRENGTH] ${STRENGTH}"
+  echo "[ZERO_CONDITION_IMAGES] ${ZERO_CONDITION_IMAGES}"
+  infer_mode_args=()
+  if [[ "${USE_A_LATENT_INIT}" == "1" ]]; then
+    infer_mode_args+=(--use_a_latent_init)
+    infer_mode_args+=(--strength "${STRENGTH}")
+  fi
+  if [[ "${ZERO_CONDITION_IMAGES}" == "1" ]]; then
+    infer_mode_args+=(--zero_condition_images)
+  fi
+
   python "${SCRIPT_DIR}/infer_sana_ab_adapter.py" \
     --checkpoint "${OUTPUT_DIR}" \
     --model "${MODEL}" \
@@ -140,11 +169,24 @@ run_infer() {
     --steps "${INFER_STEPS}" \
     --guidance_scale "${GUIDANCE_SCALE}" \
     --seed "${SEED}" \
+    "${infer_mode_args[@]}" \
     "${pretrained_args[@]}" \
     "${infer_size_args[@]}"
 }
 
 run_batch() {
+  echo "[USE_A_LATENT_INIT] ${USE_A_LATENT_INIT}"
+  echo "[STRENGTH] ${STRENGTH}"
+  echo "[ZERO_CONDITION_IMAGES] ${ZERO_CONDITION_IMAGES}"
+  batch_mode_args=()
+  if [[ "${USE_A_LATENT_INIT}" == "1" ]]; then
+    batch_mode_args+=(--use_a_latent_init)
+    batch_mode_args+=(--strength "${STRENGTH}")
+  fi
+  if [[ "${ZERO_CONDITION_IMAGES}" == "1" ]]; then
+    batch_mode_args+=(--zero_condition_images)
+  fi
+
   python "${SCRIPT_DIR}/batch_infer_sana_ab_adapter.py" \
     --checkpoint "${OUTPUT_DIR}" \
     --model "${MODEL}" \
@@ -156,6 +198,7 @@ run_batch() {
     --steps "${INFER_STEPS}" \
     --guidance_scale "${GUIDANCE_SCALE}" \
     --seed "${SEED}" \
+    "${batch_mode_args[@]}" \
     "${sample_args[@]}" \
     "${pretrained_args[@]}" \
     "${infer_size_args[@]}"

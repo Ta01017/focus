@@ -11,7 +11,7 @@ from safetensors.torch import load_file
 from diffusers import SanaPipeline
 
 from dof_utils import add_pretrained_args, prepare_inference_images, pretrained_kwargs, restore_output_size
-from sana_dof import ConditionedSanaTransformer, DualImageConditionAdapter, encode_condition_images
+from sana_dof import ConditionedSanaTransformer, DualImageConditionAdapter, encode_condition_images, encode_vae_latents
 
 
 def parse_args():
@@ -36,6 +36,9 @@ def parse_args():
     parser.add_argument("--steps", type=int, default=20)
     parser.add_argument("--guidance_scale", type=float, default=4.5)
     parser.add_argument("--seed", type=int, default=0)
+    parser.add_argument("--use_a_latent_init", action="store_true")
+    parser.add_argument("--strength", type=float, default=0.6)
+    parser.add_argument("--zero_condition_images", action="store_true")
     add_pretrained_args(parser)
     return parser.parse_args()
 
@@ -58,6 +61,16 @@ def load_pipeline(checkpoint, model_id, dtype, pretrained_options):
     return pipe, transformer, config
 
 
+@torch.no_grad()
+def prepare_a_latent_init(pipe, image_a, height, width, strength, generator, device):
+    if strength < 0 or strength > 1:
+        raise ValueError("--strength must be in [0, 1].")
+    pixel_values = pipe.image_processor.preprocess(image_a, height=height, width=width).to(device, torch.float32)
+    a_latents = encode_vae_latents(pipe.vae, pixel_values)
+    noise = torch.randn(a_latents.shape, generator=generator, device=device, dtype=a_latents.dtype)
+    return (1 - strength) * a_latents + strength * noise
+
+
 def main():
     args = parse_args()
     if not torch.cuda.is_available():
@@ -76,10 +89,20 @@ def main():
         args.downscale_if_exceeds_max_pixels,
     )
     canvas_width, canvas_height = size_info["canvas_size"]
+    condition_a = Image.new("RGB", prepared["a"].size, (0, 0, 0)) if args.zero_condition_images else prepared["a"]
+    condition_b = Image.new("RGB", prepared["b"].size, (0, 0, 0)) if args.zero_condition_images else prepared["b"]
     cond_a, cond_b = encode_condition_images(
-        pipe, prepared["a"], prepared["b"], canvas_height, canvas_width, torch.device("cuda")
+        pipe, condition_a, condition_b, canvas_height, canvas_width, torch.device("cuda")
     )
     generator = torch.Generator(device="cuda").manual_seed(args.seed)
+    latents = None
+    if args.use_a_latent_init:
+        latents = prepare_a_latent_init(
+            pipe, prepared["a"], canvas_height, canvas_width, args.strength, generator, torch.device("cuda")
+        )
+    print(f"[USE_A_LATENT_INIT] {int(args.use_a_latent_init)}", flush=True)
+    print(f"[STRENGTH] {args.strength}", flush=True)
+    print(f"[ZERO_CONDITION_IMAGES] {int(args.zero_condition_images)}", flush=True)
     with transformer.use_condition(cond_a, cond_b):
         image = pipe(
             prompt=args.prompt,
@@ -89,6 +112,7 @@ def main():
             num_inference_steps=args.steps,
             guidance_scale=args.guidance_scale,
             generator=generator,
+            latents=latents,
             use_resolution_binning=False,
         ).images[0]
     image = restore_output_size(image, size_info, args.restore_to_original_size)
