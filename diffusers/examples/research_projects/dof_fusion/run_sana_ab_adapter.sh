@@ -35,6 +35,7 @@ GRAD_ACCUM_STEPS=${GRAD_ACCUM_STEPS:-1}
 NUM_WORKERS=${NUM_WORKERS:-0}
 MAX_TRAIN_STEPS=${MAX_TRAIN_STEPS:-3000}
 SAVE_STEPS=${SAVE_STEPS:-500}
+LOG_STEPS=${LOG_STEPS:-10}
 MIXED_PRECISION=${MIXED_PRECISION:-no}
 LEARNING_RATE=${LEARNING_RATE:-1e-5}
 ADAPTER_HIDDEN_CHANNELS=${ADAPTER_HIDDEN_CHANNELS:-128}
@@ -117,6 +118,7 @@ run_train() {
     --learning_rate "${LEARNING_RATE}" \
     --max_train_steps "${MAX_TRAIN_STEPS}" \
     --save_steps "${SAVE_STEPS}" \
+    --log_steps "${LOG_STEPS}" \
     --num_workers "${NUM_WORKERS}" \
     --adapter_hidden_channels "${ADAPTER_HIDDEN_CHANNELS}" \
     --mixed_precision "${MIXED_PRECISION}" \

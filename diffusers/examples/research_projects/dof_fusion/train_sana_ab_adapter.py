@@ -48,6 +48,7 @@ def parse_args():
     parser.add_argument("--learning_rate", type=float, default=1e-5)
     parser.add_argument("--max_train_steps", type=int, default=20000)
     parser.add_argument("--save_steps", type=int, default=1000)
+    parser.add_argument("--log_steps", type=int, default=10)
     parser.add_argument("--num_workers", type=int, default=4)
     parser.add_argument("--adapter_hidden_channels", type=int, default=128)
     parser.add_argument("--train_transformer_lora", action="store_true")
@@ -84,9 +85,9 @@ def print_lora_candidate_modules(transformer):
         for name, module in transformer.named_modules()
         if isinstance(module, torch.nn.Linear) and any(keyword in name.lower() for keyword in keywords)
     ]
-    print("SANA transformer Linear module candidates containing q/k/v/out/proj:")
+    print("SANA transformer Linear module candidates containing q/k/v/out/proj:", flush=True)
     for name in candidates:
-        print(f"  {name}")
+        print(f"  {name}", flush=True)
 
 
 def validate_lora_target_modules(transformer, target_modules):
@@ -186,7 +187,10 @@ def check_finite(global_step, tensors):
             continue
         nan_count = torch.isnan(tensor).sum().item()
         inf_count = torch.isinf(tensor).sum().item()
-        print(f"Non-finite tensor at step={global_step}: {name} nan_count={nan_count} inf_count={inf_count}")
+        print(
+            f"Non-finite tensor at step={global_step}: {name} nan_count={nan_count} inf_count={inf_count}",
+            flush=True,
+        )
         raise RuntimeError(f"Non-finite values detected in {name}.")
 
 
@@ -196,6 +200,8 @@ def main():
         raise ValueError("--resolution must be divisible by --size_divisor.")
     if args.resolution is None and args.batch_size != 1:
         raise ValueError("Dynamic-resolution training requires --batch_size 1; use gradient accumulation.")
+    if args.log_steps < 1:
+        raise ValueError("--log_steps must be at least 1.")
 
     accelerator = Accelerator(
         gradient_accumulation_steps=args.gradient_accumulation_steps,
@@ -242,10 +248,14 @@ def main():
         lr=args.learning_rate,
         weight_decay=1e-2,
     )
-    accelerator.print(f"adapter trainable params: {count_parameters(adapter_trainable_parameters):,}")
-    accelerator.print(f"transformer LoRA trainable params: {count_parameters(transformer_lora_parameters):,}")
+    accelerator.print(f"adapter trainable params: {count_parameters(adapter_trainable_parameters):,}", flush=True)
     accelerator.print(
-        f"total trainable params: {count_parameters(adapter_trainable_parameters + transformer_lora_parameters):,}"
+        f"transformer LoRA trainable params: {count_parameters(transformer_lora_parameters):,}",
+        flush=True,
+    )
+    accelerator.print(
+        f"total trainable params: {count_parameters(adapter_trainable_parameters + transformer_lora_parameters):,}",
+        flush=True,
     )
 
     output_dir = Path(args.output_dir)
@@ -405,7 +415,8 @@ def main():
                             f"adapter_grad_norm={grad_norm(adapter_trainable_parameters):.6f} "
                             f"adapter_param_norm={parameter_norm(adapter_trainable_parameters):.6f} "
                             f"transformer_lora_grad_norm={grad_norm(transformer_lora_parameters):.6f} "
-                            f"transformer_lora_param_norm={parameter_norm(transformer_lora_parameters):.6f}"
+                            f"transformer_lora_param_norm={parameter_norm(transformer_lora_parameters):.6f}",
+                            flush=True,
                         )
                     accelerator.clip_grad_norm_(adapter_trainable_parameters + transformer_lora_parameters, 1.0)
                 optimizer.step()
@@ -413,8 +424,8 @@ def main():
 
             if accelerator.sync_gradients:
                 global_step += 1
-                if accelerator.is_main_process and global_step % 10 == 0:
-                    print(f"step={global_step} loss={loss.detach().item():.6f}")
+                if accelerator.is_main_process and global_step % args.log_steps == 0:
+                    print(f"step={global_step} loss={loss.detach().item():.6f}", flush=True)
                 if global_step % args.save_steps == 0 or global_step == args.max_train_steps:
                     save_checkpoint(
                         accelerator,
