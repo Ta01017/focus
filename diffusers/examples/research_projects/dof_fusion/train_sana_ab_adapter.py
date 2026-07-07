@@ -25,7 +25,7 @@ from dof_utils import (
     save_trainer_state,
 )
 from focus_dataset import DiffSynthFocusDataset
-from sana_dof import ConditionedSanaTransformer, DualImageConditionAdapter, encode_vae_latents
+from sana_dof import ConditionedSanaTransformer, DualImageConditionAdapter, encode_vae_latents, tensor_stats
 
 DEFAULT_SANA_LORA_TARGET_MODULES = ["to_k", "to_q", "to_v"]
 
@@ -69,6 +69,7 @@ def parse_args():
     parser.add_argument("--overfit_fixed_noise", action="store_true")
     parser.add_argument("--overfit_timestep_index", type=int, default=None)
     parser.add_argument("--debug_dump_batch_dir", default=None)
+    parser.add_argument("--scale_timestep_for_model", action="store_true")
     return parser.parse_args()
 
 
@@ -166,6 +167,7 @@ def save_checkpoint(accelerator, model, optimizer, directory, args, global_step,
         "init_from_a_latent": args.init_from_a_latent,
         "a_latent_noise_strength": args.a_latent_noise_strength,
         "prediction_target": args.prediction_target,
+        "scale_timestep_for_model": args.scale_timestep_for_model,
         "train_transformer_lora": args.train_transformer_lora,
         "lora_rank": args.lora_rank,
         "lora_alpha": args.lora_alpha,
@@ -392,12 +394,16 @@ def main():
                         loss_target = noise - target_latents
                     else:
                         loss_target = target_latents
+                    if args.scale_timestep_for_model:
+                        timesteps_for_model = timesteps * pipe.transformer.config.timestep_scale
+                    else:
+                        timesteps_for_model = timesteps
 
                 prediction = model(
                     noisy_latents.to(weight_dtype),
                     encoder_hidden_states=prompt_embeds,
                     encoder_attention_mask=prompt_mask,
-                    timestep=timesteps,
+                    timestep=timesteps_for_model,
                     cond_a_latents=cond_a_latents,
                     cond_b_latents=cond_b_latents,
                     return_dict=False,
@@ -426,7 +432,11 @@ def main():
                     )
                 accelerator.backward(loss)
                 if accelerator.sync_gradients:
-                    if args.debug_log_adapter_stats and accelerator.is_main_process:
+                    if (
+                        args.debug_log_adapter_stats
+                        and accelerator.is_main_process
+                        and global_step % args.log_steps == 0
+                    ):
                         print(
                             "trainable_stats "
                             f"step={global_step} "
@@ -436,6 +446,21 @@ def main():
                             f"transformer_lora_param_norm={parameter_norm(transformer_lora_parameters):.6f}",
                             flush=True,
                         )
+                        debug_stats = {
+                            "target_latents": tensor_stats(target_latents),
+                            "cond_a_latents": tensor_stats(cond_a_latents),
+                            "cond_b_latents": tensor_stats(cond_b_latents),
+                            "noise": tensor_stats(noise),
+                            "noisy_latents": tensor_stats(noisy_latents),
+                            "loss_target": tensor_stats(loss_target),
+                            "prediction": tensor_stats(prediction),
+                            "timesteps": tensor_stats(timesteps),
+                            "sigmas": tensor_stats(sigmas),
+                            "init_from_a_latent": args.init_from_a_latent,
+                            "a_latent_noise_strength": args.a_latent_noise_strength,
+                            "prediction_target": args.prediction_target,
+                        }
+                        print(json.dumps(debug_stats, ensure_ascii=False), flush=True)
                     accelerator.clip_grad_norm_(adapter_trainable_parameters + transformer_lora_parameters, 1.0)
                 optimizer.step()
                 optimizer.zero_grad(set_to_none=True)

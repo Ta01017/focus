@@ -17,7 +17,13 @@ from dof_utils import (
     sample_prompt,
     select_records,
 )
-from infer_sana_ab_adapter import load_pipeline, prepare_a_latent_init
+from infer_sana_ab_adapter import (
+    decode_latents_to_pil,
+    encode_image_latents,
+    generate_sana_img2img_sliced,
+    load_pipeline,
+    save_latent_debug,
+)
 from metadata import load_metadata, require_keys, resolve_data_path
 from sana_dof import encode_condition_images
 
@@ -47,6 +53,8 @@ def parse_args():
     parser.add_argument("--use_a_latent_init", action="store_true")
     parser.add_argument("--strength", type=float, default=0.6)
     parser.add_argument("--zero_condition_images", action="store_true")
+    parser.add_argument("--img2img_schedule_mode", choices=("pipeline_full", "sliced"), default="pipeline_full")
+    parser.add_argument("--debug_latent_dir", default=None)
     return parser.parse_args()
 
 
@@ -74,10 +82,13 @@ def main():
         raise RuntimeError("This reference script requires CUDA.")
 
     dtype = torch.bfloat16 if torch.cuda.is_bf16_supported() else torch.float16
-    pipe, transformer, _ = load_pipeline(Path(args.checkpoint), args.model, dtype, pretrained_kwargs(args))
+    pipe, transformer, config = load_pipeline(Path(args.checkpoint), args.model, dtype, pretrained_kwargs(args))
+    model_id = args.model or config["base_model"]
     print(f"[USE_A_LATENT_INIT] {int(args.use_a_latent_init)}", flush=True)
     print(f"[STRENGTH] {args.strength}", flush=True)
     print(f"[ZERO_CONDITION_IMAGES] {int(args.zero_condition_images)}", flush=True)
+    print(f"[IMG2IMG_SCHEDULE_MODE] {args.img2img_schedule_mode}", flush=True)
+    print(f"[DEBUG_LATENT_DIR] {args.debug_latent_dir}", flush=True)
     records = load_metadata(args.dataset_metadata_path)
     items = select_records(records, args.start_index, args.max_samples)
     output_dir = Path(args.output_dir)
@@ -111,21 +122,78 @@ def main():
             seed = int(record.get(args.seed_key, args.seed + index))
             generator = torch.Generator(device="cuda").manual_seed(seed)
             latents = None
+            noise = None
+            final_latents = None
+            schedule_stats = {}
             if args.use_a_latent_init:
-                latents = prepare_a_latent_init(
-                    pipe, prepared["a"], canvas_height, canvas_width, args.strength, generator, torch.device("cuda")
+                if args.img2img_schedule_mode == "pipeline_full":
+                    a_latents = encode_image_latents(pipe, prepared["a"], canvas_height, canvas_width, torch.device("cuda"))
+                    noise = torch.randn(a_latents.shape, generator=generator, device="cuda", dtype=a_latents.dtype)
+                    latents = (1 - args.strength) * a_latents + args.strength * noise
+                else:
+                    image, final_latents, schedule_stats, noise, latents = generate_sana_img2img_sliced(
+                        pipe,
+                        transformer,
+                        sample_prompt(record, args.prompt_key, args.prompt),
+                        "",
+                        prepared["a"],
+                        cond_a,
+                        cond_b,
+                        canvas_height,
+                        canvas_width,
+                        args.steps,
+                        args.guidance_scale,
+                        args.strength,
+                        generator,
+                    )
+            if not (args.use_a_latent_init and args.img2img_schedule_mode == "sliced"):
+                with transformer.use_condition(cond_a, cond_b):
+                    final_latents = pipe(
+                        prompt=sample_prompt(record, args.prompt_key, args.prompt),
+                        height=canvas_height,
+                        width=canvas_width,
+                        num_inference_steps=args.steps,
+                        guidance_scale=args.guidance_scale,
+                        generator=generator,
+                        latents=latents,
+                        output_type="latent",
+                        use_resolution_binning=False,
+                    ).images
+                image = decode_latents_to_pil(pipe, final_latents)
+                pipe.scheduler.set_timesteps(args.steps, device=torch.device("cuda"))
+                timesteps = pipe.scheduler.timesteps
+                schedule_stats = {
+                    "num_inference_steps": args.steps,
+                    "init_timestep": None,
+                    "t_start": None,
+                    "actual_num_denoise_steps": len(timesteps),
+                    "selected_sigma": None,
+                    "timesteps_first": float(timesteps[0].detach().cpu()),
+                    "timesteps_last": float(timesteps[-1].detach().cpu()),
+                    "sliced_timesteps_first": None,
+                    "sliced_timesteps_last": None,
+                }
+            if args.debug_latent_dir is not None:
+                debug_args = argparse.Namespace(**vars(args))
+                debug_args.prompt = sample_prompt(record, args.prompt_key, args.prompt)
+                debug_args.checkpoint = str(args.checkpoint)
+                save_latent_debug(
+                    Path(args.debug_latent_dir) / f"sample_{index:06d}",
+                    args=debug_args,
+                    model_id=model_id,
+                    pipe=pipe,
+                    prepared=prepared,
+                    size_info=size_info,
+                    canvas_width=canvas_width,
+                    canvas_height=canvas_height,
+                    cond_a=cond_a,
+                    cond_b=cond_b,
+                    noise=noise,
+                    init_latents=latents,
+                    final_latents=final_latents,
+                    image=image,
+                    schedule_stats=schedule_stats,
                 )
-            with transformer.use_condition(cond_a, cond_b):
-                image = pipe(
-                    prompt=sample_prompt(record, args.prompt_key, args.prompt),
-                    height=canvas_height,
-                    width=canvas_width,
-                    num_inference_steps=args.steps,
-                    guidance_scale=args.guidance_scale,
-                    generator=generator,
-                    latents=latents,
-                    use_resolution_binning=False,
-                ).images[0]
             image = restore_output_size(image, size_info, args.restore_to_original_size)
             output.parent.mkdir(parents=True, exist_ok=True)
             image.save(output)

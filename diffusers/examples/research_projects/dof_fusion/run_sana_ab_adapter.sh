@@ -42,6 +42,7 @@ ADAPTER_HIDDEN_CHANNELS=${ADAPTER_HIDDEN_CHANNELS:-128}
 INIT_FROM_A_LATENT=${INIT_FROM_A_LATENT:-0}
 A_LATENT_NOISE_STRENGTH=${A_LATENT_NOISE_STRENGTH:-1.0}
 PREDICTION_TARGET=${PREDICTION_TARGET:-velocity}
+SCALE_TIMESTEP_FOR_MODEL=${SCALE_TIMESTEP_FOR_MODEL:-0}
 TRAIN_TRANSFORMER_LORA=${TRAIN_TRANSFORMER_LORA:-0}
 LORA_RANK=${LORA_RANK:-8}
 LORA_ALPHA=${LORA_ALPHA:-8}
@@ -59,6 +60,8 @@ GUIDANCE_SCALE=${GUIDANCE_SCALE:-4.5}
 USE_A_LATENT_INIT=${USE_A_LATENT_INIT:-0}
 STRENGTH=${STRENGTH:-0.6}
 ZERO_CONDITION_IMAGES=${ZERO_CONDITION_IMAGES:-0}
+IMG2IMG_SCHEDULE_MODE=${IMG2IMG_SCHEDULE_MODE:-pipeline_full}
+DEBUG_LATENT_DIR=${DEBUG_LATENT_DIR:-}
 SEED=${SEED:-0}
 RESTORE_TO_ORIGINAL_SIZE=${RESTORE_TO_ORIGINAL_SIZE:-1}
 IMAGE_A=${IMAGE_A:-${TRAIN_BASE}/a.png}
@@ -99,6 +102,8 @@ run_train() {
   echo "[INIT_FROM_A_LATENT] ${INIT_FROM_A_LATENT}"
   echo "[A_LATENT_NOISE_STRENGTH] ${A_LATENT_NOISE_STRENGTH}"
   echo "[PREDICTION_TARGET] ${PREDICTION_TARGET}"
+  echo "[LOG_STEPS] ${LOG_STEPS}"
+  echo "[SCALE_TIMESTEP_FOR_MODEL] ${SCALE_TIMESTEP_FOR_MODEL}"
   echo "[TRAIN_TRANSFORMER_LORA] ${TRAIN_TRANSFORMER_LORA}"
   echo "[LORA_RANK] ${LORA_RANK}"
   echo "[LORA_ALPHA] ${LORA_ALPHA}"
@@ -118,6 +123,9 @@ run_train() {
     init_args+=(--init_from_a_latent)
     init_args+=(--a_latent_noise_strength "${A_LATENT_NOISE_STRENGTH}")
     init_args+=(--prediction_target "${PREDICTION_TARGET}")
+  fi
+  if [[ "${SCALE_TIMESTEP_FOR_MODEL}" == "1" ]]; then
+    init_args+=(--scale_timestep_for_model)
   fi
 
   accelerate launch \
@@ -150,6 +158,8 @@ run_infer() {
   echo "[USE_A_LATENT_INIT] ${USE_A_LATENT_INIT}"
   echo "[STRENGTH] ${STRENGTH}"
   echo "[ZERO_CONDITION_IMAGES] ${ZERO_CONDITION_IMAGES}"
+  echo "[IMG2IMG_SCHEDULE_MODE] ${IMG2IMG_SCHEDULE_MODE}"
+  echo "[DEBUG_LATENT_DIR] ${DEBUG_LATENT_DIR}"
   infer_mode_args=()
   if [[ "${USE_A_LATENT_INIT}" == "1" ]]; then
     infer_mode_args+=(--use_a_latent_init)
@@ -157,6 +167,10 @@ run_infer() {
   fi
   if [[ "${ZERO_CONDITION_IMAGES}" == "1" ]]; then
     infer_mode_args+=(--zero_condition_images)
+  fi
+  infer_mode_args+=(--img2img_schedule_mode "${IMG2IMG_SCHEDULE_MODE}")
+  if [[ -n "${DEBUG_LATENT_DIR}" ]]; then
+    infer_mode_args+=(--debug_latent_dir "${DEBUG_LATENT_DIR}")
   fi
 
   python "${SCRIPT_DIR}/infer_sana_ab_adapter.py" \
@@ -178,6 +192,8 @@ run_batch() {
   echo "[USE_A_LATENT_INIT] ${USE_A_LATENT_INIT}"
   echo "[STRENGTH] ${STRENGTH}"
   echo "[ZERO_CONDITION_IMAGES] ${ZERO_CONDITION_IMAGES}"
+  echo "[IMG2IMG_SCHEDULE_MODE] ${IMG2IMG_SCHEDULE_MODE}"
+  echo "[DEBUG_LATENT_DIR] ${DEBUG_LATENT_DIR}"
   batch_mode_args=()
   if [[ "${USE_A_LATENT_INIT}" == "1" ]]; then
     batch_mode_args+=(--use_a_latent_init)
@@ -185,6 +201,10 @@ run_batch() {
   fi
   if [[ "${ZERO_CONDITION_IMAGES}" == "1" ]]; then
     batch_mode_args+=(--zero_condition_images)
+  fi
+  batch_mode_args+=(--img2img_schedule_mode "${IMG2IMG_SCHEDULE_MODE}")
+  if [[ -n "${DEBUG_LATENT_DIR}" ]]; then
+    batch_mode_args+=(--debug_latent_dir "${DEBUG_LATENT_DIR}")
   fi
 
   python "${SCRIPT_DIR}/batch_infer_sana_ab_adapter.py" \
