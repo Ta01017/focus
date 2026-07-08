@@ -17,10 +17,23 @@ export TOKENIZERS_PARALLELISM=${TOKENIZERS_PARALLELISM:-false}
 
 TRAIN_MAX_SAMPLES=${TRAIN_MAX_SAMPLES:-}
 MAX_TRAIN_STEPS=${MAX_TRAIN_STEPS:-2000}
+LEARNING_RATE=${LEARNING_RATE:-2e-5}
+TRAIN_BATCH_SIZE=${TRAIN_BATCH_SIZE:-1}
+GRADIENT_ACCUMULATION_STEPS=${GRADIENT_ACCUMULATION_STEPS:-1}
+SAVE_STEPS=${SAVE_STEPS:-1000}
+NUM_WORKERS=${NUM_WORKERS:-0}
 LOSS_MODE=${LOSS_MODE:-legacy_a_noise_gt_velocity}
 CONTROL_CONDITION_CHANNELS=${CONTROL_CONDITION_CHANNELS:-8}
 USE_FOCUS_CONDITIONS=${USE_FOCUS_CONDITIONS:-1}
 MAX_PIXELS=${MAX_PIXELS:-1048576}
+SIZE_DIVISOR=${SIZE_DIVISOR:-32}
+DOWNSCALE_IF_EXCEEDS_MAX_PIXELS=${DOWNSCALE_IF_EXCEEDS_MAX_PIXELS:-1}
+GRADIENT_CHECKPOINTING=${GRADIENT_CHECKPOINTING:-0}
+CONDITIONING_SCALE=${CONDITIONING_SCALE:-1.0}
+TRAIN_TRANSFORMER_LORA=${TRAIN_TRANSFORMER_LORA:-0}
+LORA_RANK=${LORA_RANK:-8}
+LORA_ALPHA=${LORA_ALPHA:-8}
+LORA_TARGET_MODULES=${LORA_TARGET_MODULES:-to_q,to_k,to_v}
 STRENGTH=${STRENGTH:-0.2}
 IMG2IMG_SCHEDULE_MODE=${IMG2IMG_SCHEDULE_MODE:-sliced}
 LOCAL_FILES_ONLY=${LOCAL_FILES_ONLY:-1}
@@ -50,6 +63,20 @@ debug_args=()
 if [[ -n "${DEBUG_LATENT_DIR}" ]]; then
   debug_args+=(--debug_latent_dir "${DEBUG_LATENT_DIR}")
 fi
+size_args=(--size_divisor "${SIZE_DIVISOR}")
+if [[ "${DOWNSCALE_IF_EXCEEDS_MAX_PIXELS}" == "1" ]]; then
+  size_args+=(--downscale_if_exceeds_max_pixels)
+fi
+train_extra_args=()
+if [[ "${GRADIENT_CHECKPOINTING}" == "1" ]]; then
+  train_extra_args+=(--gradient_checkpointing)
+fi
+if [[ "${TRAIN_TRANSFORMER_LORA}" == "1" ]]; then
+  train_extra_args+=(--train_transformer_lora)
+  train_extra_args+=(--lora_rank "${LORA_RANK}")
+  train_extra_args+=(--lora_alpha "${LORA_ALPHA}")
+  train_extra_args+=(--lora_target_modules "${LORA_TARGET_MODULES}")
+fi
 
 echo "[MODE] ${MODE}"
 echo "[LOSS_MODE] ${LOSS_MODE}"
@@ -63,6 +90,19 @@ echo "[MODEL] ${MODEL}"
 echo "[DATASET_METADATA_PATH] ${TRAIN_META}"
 echo "[IMG2IMG_SCHEDULE_MODE] ${IMG2IMG_SCHEDULE_MODE}"
 echo "[DEBUG_LATENT_DIR] ${DEBUG_LATENT_DIR}"
+echo "[LEARNING_RATE] ${LEARNING_RATE}"
+echo "[TRAIN_BATCH_SIZE] ${TRAIN_BATCH_SIZE}"
+echo "[GRADIENT_ACCUMULATION_STEPS] ${GRADIENT_ACCUMULATION_STEPS}"
+echo "[SAVE_STEPS] ${SAVE_STEPS}"
+echo "[NUM_WORKERS] ${NUM_WORKERS}"
+echo "[SIZE_DIVISOR] ${SIZE_DIVISOR}"
+echo "[DOWNSCALE_IF_EXCEEDS_MAX_PIXELS] ${DOWNSCALE_IF_EXCEEDS_MAX_PIXELS}"
+echo "[GRADIENT_CHECKPOINTING] ${GRADIENT_CHECKPOINTING}"
+echo "[CONDITIONING_SCALE] ${CONDITIONING_SCALE}"
+echo "[TRAIN_TRANSFORMER_LORA] ${TRAIN_TRANSFORMER_LORA}"
+echo "[LORA_RANK] ${LORA_RANK}"
+echo "[LORA_ALPHA] ${LORA_ALPHA}"
+echo "[LORA_TARGET_MODULES] ${LORA_TARGET_MODULES}"
 
 run_train() {
   accelerate launch --num_processes 1 --mixed_precision "${MIXED_PRECISION}" \
@@ -73,11 +113,19 @@ run_train() {
     --output_dir "${OUTPUT_DIR}" \
     --loss_mode "${LOSS_MODE}" \
     --control_condition_channels "${CONTROL_CONDITION_CHANNELS}" \
+    --batch_size "${TRAIN_BATCH_SIZE}" \
+    --gradient_accumulation_steps "${GRADIENT_ACCUMULATION_STEPS}" \
+    --learning_rate "${LEARNING_RATE}" \
     --max_pixels "${MAX_PIXELS}" \
     --max_train_steps "${MAX_TRAIN_STEPS}" \
+    --save_steps "${SAVE_STEPS}" \
     --log_steps "${LOG_STEPS}" \
+    --num_workers "${NUM_WORKERS}" \
+    --conditioning_scale "${CONDITIONING_SCALE}" \
     --mixed_precision "${MIXED_PRECISION}" \
     "${focus_args[@]}" \
+    "${size_args[@]}" \
+    "${train_extra_args[@]}" \
     "${sample_args[@]}" \
     "${pretrained_args[@]}"
 }
@@ -95,7 +143,9 @@ run_infer() {
     --strength "${STRENGTH}" \
     --img2img_schedule_mode "${IMG2IMG_SCHEDULE_MODE}" \
     --max_pixels "${MAX_PIXELS}" \
+    --conditioning_scale "${CONDITIONING_SCALE}" \
     "${infer_focus_args[@]}" \
+    "${size_args[@]}" \
     "${debug_args[@]}" \
     "${pretrained_args[@]}"
 }
@@ -110,6 +160,8 @@ run_batch() {
     --strength "${STRENGTH}" \
     --img2img_schedule_mode "${IMG2IMG_SCHEDULE_MODE}" \
     --max_pixels "${MAX_PIXELS}" \
+    --conditioning_scale "${CONDITIONING_SCALE}" \
+    "${size_args[@]}" \
     "${debug_args[@]}" \
     "${pretrained_args[@]}"
 }

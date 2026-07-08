@@ -8,6 +8,7 @@ import numpy as np
 import torch
 from PIL import Image
 from safetensors.torch import load_file
+from torch.nn import functional as F
 
 from diffusers import SanaControlNetModel, SanaPipeline
 
@@ -123,7 +124,18 @@ def generate(pipe, controlnet, projection, prompt, negative_prompt, image_a, con
         noise = torch.randn(a_latents.shape, generator=generator, device=device, dtype=a_latents.dtype)
         latents = (1 - strength) * a_latents + strength * noise if strength > 0 else noise
         sigma = None
-    controlnet_cond = projection(control_condition.to(device).float()).to(latents)
+    control_condition = control_condition.to(device).float()
+    control_condition_raw_shape = list(control_condition.shape)
+    if control_condition.shape[-2:] != latents.shape[-2:]:
+        control_condition = F.interpolate(
+            control_condition,
+            size=latents.shape[-2:],
+            mode="bilinear",
+            align_corners=False,
+        )
+    control_condition_downsampled_shape = list(control_condition.shape)
+    controlnet_cond = projection(control_condition).to(latents)
+    controlnet_cond_shape = list(controlnet_cond.shape)
     final_residual_stats = None
     for t in sliced:
         latent_model_input = torch.cat([latents] * 2) if do_cfg else latents
@@ -167,6 +179,10 @@ def generate(pipe, controlnet, projection, prompt, negative_prompt, image_a, con
         "init_latents": tensor_stats(a_latents),
         "final_latents": tensor_stats(latents),
         "control_residual": final_residual_stats,
+        "control_condition_raw_shape": control_condition_raw_shape,
+        "control_condition_downsampled_shape": control_condition_downsampled_shape,
+        "latents_shape": list(latents.shape),
+        "controlnet_cond_shape": controlnet_cond_shape,
     }
 
 

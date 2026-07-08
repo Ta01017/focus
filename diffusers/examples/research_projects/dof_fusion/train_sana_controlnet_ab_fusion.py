@@ -90,9 +90,25 @@ class SanaControlNetABFusionModel(nn.Module):
         self.controlnet = controlnet
         self.condition_projection = condition_projection
         self.last_residual_stats = None
+        self.last_shape_stats = None
 
     def forward(self, hidden_states, encoder_hidden_states, encoder_attention_mask, timestep, control_condition, conditioning_scale):
+        raw_shape = list(control_condition.shape)
+        if control_condition.shape[-2:] != hidden_states.shape[-2:]:
+            control_condition = F.interpolate(
+                control_condition.float(),
+                size=hidden_states.shape[-2:],
+                mode="bilinear",
+                align_corners=False,
+            )
+        downsampled_shape = list(control_condition.shape)
         controlnet_cond = self.condition_projection(control_condition.float()).to(hidden_states)
+        self.last_shape_stats = {
+            "control_condition_raw_shape": raw_shape,
+            "control_condition_downsampled_shape": downsampled_shape,
+            "hidden_states_shape": list(hidden_states.shape),
+            "controlnet_cond_shape": list(controlnet_cond.shape),
+        }
         controlnet_dtype = self.controlnet.dtype
         control_samples = self.controlnet(
             hidden_states.to(controlnet_dtype),
@@ -348,6 +364,7 @@ def main():
                         "focus_b": tensor_stats(batch["focus_b"]),
                         "controlnet_grad_norm": None if grad is None else float(grad.detach().cpu()),
                         "control_residual": accelerator.unwrap_model(model).last_residual_stats,
+                        "shape_stats": accelerator.unwrap_model(model).last_shape_stats,
                     }, ensure_ascii=False), flush=True)
                 if global_step % args.save_steps == 0 or global_step == args.max_train_steps:
                     unwrapped = accelerator.unwrap_model(model)
