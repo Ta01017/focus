@@ -42,6 +42,24 @@ def load_rgb(path):
     return Image.open(path).convert("RGB")
 
 
+def write_json(path, data):
+    path = Path(path)
+    path.parent.mkdir(parents=True, exist_ok=True)
+    path.write_text(json.dumps(data, indent=2, ensure_ascii=False), encoding="utf-8")
+
+
+def tensor_stats(x):
+    x = x.detach().float().cpu()
+    return {
+        "shape": list(x.shape),
+        "min": float(x.min()),
+        "max": float(x.max()),
+        "mean": float(x.mean()),
+        "std": float(x.std()),
+        "dtype": str(x.dtype),
+    }
+
+
 def add_pretrained_args(parser):
     parser.add_argument("--local_files_only", action="store_true")
     parser.add_argument("--cache_dir", default=None)
@@ -140,6 +158,29 @@ def preprocess_pair_or_triplet(
     return prepared, size_info
 
 
+def preprocess_triplet(gt, src, ref, max_pixels=None, size_divisor=32, downscale_if_exceeds_max_pixels=False):
+    return preprocess_pair_or_triplet(
+        gt,
+        src,
+        ref,
+        max_pixels=max_pixels,
+        size_divisor=size_divisor,
+        downscale_if_exceeds_max_pixels=downscale_if_exceeds_max_pixels,
+    )
+
+
+def preprocess_pair(src, ref, max_pixels=None, size_divisor=32, downscale_if_exceeds_max_pixels=False):
+    prepared, size_info = preprocess_pair_or_triplet(
+        src,
+        src,
+        ref,
+        max_pixels=max_pixels,
+        size_divisor=size_divisor,
+        downscale_if_exceeds_max_pixels=downscale_if_exceeds_max_pixels,
+    )
+    return {"src": prepared["src"], "ref": prepared["ref"]}, size_info
+
+
 def build_control_condition(src_tensor, ref_tensor):
     """Build [src_rgb, ref_rgb] condition. Inputs are SANA image tensors in [-1, 1]."""
     if src_tensor.ndim == 3:
@@ -155,6 +196,16 @@ def restore_output_size(image, size_info, restore_to_original_size=True):
     if restore_to_original_size and image.size != size_info["original_size"]:
         image = image.resize(size_info["original_size"], Image.Resampling.LANCZOS)
     return image
+
+
+def image_tensor_to_pil(image_processor, tensor):
+    return image_processor.postprocess(tensor, output_type="pil")[0]
+
+
+def save_debug_image(path, image):
+    path = Path(path)
+    path.parent.mkdir(parents=True, exist_ok=True)
+    image.save(path)
 
 
 def artifact_paths(sample, base_path, target_key="image", prompt_key="prompt"):
@@ -177,6 +228,15 @@ def artifact_paths(sample, base_path, target_key="image", prompt_key="prompt"):
         "ref": resolve_path(base_path, ref),
         "prompt": sample.get(prompt_key) or DEFAULT_REPAIR_PROMPT,
     }
+
+
+def get_artifact_repair_paths(item, dataset_base_path, index=None, target_key="image", prompt_key="prompt"):
+    paths = artifact_paths(item, dataset_base_path, target_key=target_key, prompt_key=prompt_key)
+    paths["index"] = index
+    paths["obj_name"] = item.get("obj_name")
+    paths["test_uid"] = item.get("test_uid")
+    paths["output_name"] = artifact_output_name(item, index if index is not None else 0)
+    return paths
 
 
 def artifact_output_name(sample, index):

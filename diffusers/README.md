@@ -35,6 +35,8 @@ limitations under the License.
 - Interchangeable noise [schedulers](https://huggingface.co/docs/diffusers/api/schedulers/overview) for different diffusion speeds and output quality.
 - Pretrained [models](https://huggingface.co/docs/diffusers/api/models/overview) that can be used as building blocks, and combined with schedulers, for creating your own end-to-end diffusion systems.
 
+Research project entry: [SANA Artifact Repair / Bottom-Surface Repair](examples/research_projects/artifact_repair/README.md).
+
 ## Installation
 
 We recommend installing 🤗 Diffusers in a virtual environment from PyPI or Conda. For more details about installing [PyTorch](https://pytorch.org/get-started/locally/), please refer to their official documentation.

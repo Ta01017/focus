@@ -1,10 +1,10 @@
 #!/usr/bin/env python
 
 import argparse
-import json
 from pathlib import Path
 
 import torch
+from PIL import Image
 
 from artifact_repair_utils import (
     DEFAULT_REPAIR_PROMPT,
@@ -14,17 +14,17 @@ from artifact_repair_utils import (
     get_artifact_repair_paths,
     load_metadata,
     load_rgb,
-    preprocess_pair_or_triplet,
+    preprocess_pair,
     pretrained_kwargs,
     restore_output_size,
     select_records,
     write_json,
 )
-from infer_sana_artifact_repair_controlnet import generate, load_pipeline
+from infer_sana_artifact_repair_froma import generate, load_pipeline
 
 
 def parse_args():
-    parser = argparse.ArgumentParser(description="Batch infer SANA artifact repair ControlNet.")
+    parser = argparse.ArgumentParser(description="Batch infer SANA artifact repair from-src adapter without ControlNet.")
     parser.add_argument("--checkpoint", required=True)
     parser.add_argument("--model", default=None)
     parser.add_argument("--dataset_metadata_path", required=True)
@@ -46,7 +46,7 @@ def parse_args():
     parser.add_argument("--img2img_schedule_mode", choices=("pipeline_full", "sliced"), default="sliced")
     parser.add_argument("--steps", type=int, default=20)
     parser.add_argument("--guidance_scale", type=float, default=1.0)
-    parser.add_argument("--conditioning_scale", type=float, default=1.0)
+    parser.add_argument("--adapter_scale", type=float, default=1.0)
     parser.add_argument("--seed", type=int, default=0)
     parser.add_argument("--max_pixels", type=int, default=1048576)
     parser.add_argument("--size_divisor", type=int, default=32)
@@ -68,9 +68,8 @@ def main():
         raise ValueError("This dynamic-size batch script currently supports --batch_size 1.")
     if not torch.cuda.is_available():
         raise RuntimeError("CUDA is required.")
-
     dtype = torch.bfloat16 if torch.cuda.is_bf16_supported() else torch.float16
-    pipe, controlnet, projection, _ = load_pipeline(Path(args.checkpoint), args.model, dtype, pretrained_kwargs(args))
+    pipe, adapter, _ = load_pipeline(Path(args.checkpoint), args.model, dtype, pretrained_kwargs(args))
     records = load_metadata(args.dataset_metadata_path)
     selected = select_records(records, args.start_index, args.max_samples)
     output_dir = Path(args.output_dir)
@@ -79,67 +78,40 @@ def main():
 
     for index, sample in selected:
         output_path = output_dir / artifact_output_name(sample, index)
-        result_record = {
-            "index": index,
-            "obj_name": sample.get("obj_name"),
-            "test_uid": sample.get("test_uid"),
-            args.result_key: str(output_path),
-            "output": str(output_path),
-        }
         try:
             paths = get_artifact_repair_paths(sample, args.dataset_base_path, index, args.target_key, args.prompt_key)
             prompt = paths["prompt"] or args.prompt
-            result_record.update({
-                "src": str(paths["src"]),
-                "ref": str(paths["ref"]),
-                "gt": str(paths["gt"]) if paths.get("gt") else None,
-                "prompt": prompt,
-                "strength": args.strength,
-                "mode": args.img2img_schedule_mode,
-                "conditioning_scale": args.conditioning_scale,
-                "seed": int(sample.get(args.seed_key, args.seed)),
-            })
             if args.skip_existing and output_path.exists():
-                result_record["status"] = "skipped_existing"
-                results.append(result_record)
+                results.append({
+                    "index": index,
+                    "obj_name": sample.get("obj_name"),
+                    "test_uid": sample.get("test_uid"),
+                    "src": str(paths["src"]),
+                    "ref": str(paths["ref"]),
+                    "gt": str(paths["gt"]) if paths.get("gt") else None,
+                    "prompt": prompt,
+                    "output": str(output_path),
+                    "status": "skipped_existing",
+                })
                 continue
             src = load_rgb(paths["src"])
             ref = load_rgb(paths["ref"])
-            prepared, size_info = preprocess_pair_or_triplet(
-                src,
-                src,
-                ref,
-                max_pixels=args.max_pixels,
-                size_divisor=args.size_divisor,
-                downscale_if_exceeds_max_pixels=args.downscale_if_exceeds_max_pixels,
-            )
+            prepared, size_info = preprocess_pair(src, ref, args.max_pixels, args.size_divisor, args.downscale_if_exceeds_max_pixels)
             canvas_w, canvas_h = size_info["canvas_size"]
-            cond_src = prepared["src"]
-            cond_ref = prepared["ref"]
-            if args.zero_src_condition:
-                from PIL import Image
-
-                cond_src = Image.new("RGB", prepared["src"].size, (0, 0, 0))
-            if args.zero_ref_condition:
-                from PIL import Image
-
-                cond_ref = Image.new("RGB", prepared["ref"].size, (0, 0, 0))
+            cond_src = Image.new("RGB", prepared["src"].size, (0, 0, 0)) if args.zero_src_condition else prepared["src"]
+            cond_ref = Image.new("RGB", prepared["ref"].size, (0, 0, 0)) if args.zero_ref_condition else prepared["ref"]
             src_tensor = pipe.image_processor.preprocess(cond_src, height=canvas_h, width=canvas_w)
             ref_tensor = pipe.image_processor.preprocess(cond_ref, height=canvas_h, width=canvas_w)
-            control_condition = build_control_condition(src_tensor, ref_tensor)
+            condition = build_control_condition(src_tensor, ref_tensor)
             seed = int(sample.get(args.seed_key, args.seed))
             generator = torch.Generator(device="cuda").manual_seed(seed)
-            debug_dir = None
-            if args.debug_latent_dir:
-                debug_dir = Path(args.debug_latent_dir) / output_path.stem
-            image, _, _, stats = generate(
+            image, _, _, _, stats = generate(
                 pipe,
-                controlnet,
-                projection,
+                adapter,
                 prompt,
                 args.negative_prompt,
                 prepared["src"],
-                control_condition,
+                condition,
                 canvas_h,
                 canvas_w,
                 args.steps,
@@ -147,31 +119,45 @@ def main():
                 args.strength,
                 args.img2img_schedule_mode,
                 generator,
-                args.conditioning_scale,
+                args.adapter_scale,
             )
-            if debug_dir:
-                debug_dir.mkdir(parents=True, exist_ok=True)
-                prepared["src"].save(debug_dir / "raw_src.png")
-                prepared["ref"].save(debug_dir / "raw_ref.png")
-                image.save(debug_dir / "final_output.png")
-                (debug_dir / "latent_stats.json").write_text(
-                    json.dumps(stats, indent=2, ensure_ascii=False),
-                    encoding="utf-8",
-                )
+            if args.debug_latent_dir:
+                debug = Path(args.debug_latent_dir) / output_path.stem
+                debug.mkdir(parents=True, exist_ok=True)
+                prepared["src"].save(debug / "raw_src.png")
+                prepared["ref"].save(debug / "raw_ref.png")
+                image.save(debug / "final_output.png")
+                write_json(debug / "latent_stats.json", stats)
             image = restore_output_size(image, size_info, args.restore_to_original_size)
             image.save(output_path)
-            result_record["status"] = "ok"
-            result_record["seed"] = seed
+            results.append({
+                "index": index,
+                "obj_name": sample.get("obj_name"),
+                "test_uid": sample.get("test_uid"),
+                "src": str(paths["src"]),
+                "ref": str(paths["ref"]),
+                "gt": str(paths["gt"]) if paths.get("gt") else None,
+                "prompt": prompt,
+                args.result_key: str(output_path),
+                "output": str(output_path),
+                "strength": args.strength,
+                "mode": args.img2img_schedule_mode,
+                "adapter_scale": args.adapter_scale,
+                "seed": seed,
+                "status": "ok",
+            })
         except Exception as exc:
-            result_record["status"] = "error"
-            result_record["error"] = repr(exc)
-            results.append(result_record)
+            results.append({
+                "index": index,
+                "obj_name": sample.get("obj_name"),
+                "test_uid": sample.get("test_uid"),
+                "output": str(output_path),
+                "status": "error",
+                "error": repr(exc),
+            })
+            write_json(output_dir / "metadata_results.json", results)
             if not args.continue_on_error:
-                write_json(output_dir / "metadata_results.json", results)
                 raise
-            continue
-        results.append(result_record)
-
     write_json(output_dir / "metadata_results.json", results)
 
 
