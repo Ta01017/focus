@@ -21,7 +21,8 @@ from diffusers import FlowMatchEulerDiscreteScheduler, SanaPipeline
 
 from dof_utils import add_metadata_args, add_pretrained_args, prepare_dynamic_images, pretrained_kwargs
 from metadata import load_metadata, require_keys, resolve_data_path
-from sana_dof import encode_vae_latents, tensor_stats
+from focus_routing_utils import build_focus_routing_masks, mask_means, weighted_mean
+from sana_dof import decode_vae_latents, encode_vae_latents, tensor_stats
 from sana_sprint_controlnet import initialize_controlnet_from_transformer
 
 
@@ -62,6 +63,28 @@ def parse_args():
     parser.add_argument("--gradient_checkpointing", action="store_true")
     parser.add_argument("--seed", type=int, default=0)
     parser.add_argument("--mixed_precision", choices=("no", "fp16", "bf16"), default="no")
+    parser.add_argument("--use_focus_loss_weighting", action="store_true", default=False)
+    parser.add_argument("--keep_loss_weight", type=float, default=1.0)
+    parser.add_argument("--bref_loss_weight", type=float, default=5.0)
+    parser.add_argument("--gen_loss_weight", type=float, default=2.0)
+    parser.add_argument("--focus_mask_gamma", type=float, default=1.0)
+    parser.add_argument("--keep_mask_threshold", type=float, default=0.55)
+    parser.add_argument("--bref_mask_threshold", type=float, default=0.35)
+    parser.add_argument("--use_soft_focus_masks", action="store_true", default=False)
+    parser.add_argument("--x0_loss_weight", type=float, default=0.0)
+    parser.add_argument("--x0_loss_type", choices=("l1", "mse"), default="l1")
+    parser.add_argument("--keep_consistency_loss_weight", type=float, default=0.0)
+    parser.add_argument("--keep_consistency_target", choices=("a_latent", "gt_latent"), default="a_latent")
+    parser.add_argument("--pixel_loss_weight", type=float, default=0.0)
+    parser.add_argument("--pixel_loss_type", choices=("l1", "l1_lap"), default="l1")
+    parser.add_argument("--pixel_loss_every_n_steps", type=int, default=1)
+    parser.add_argument("--pixel_loss_max_pixels", type=int, default=524288)
+    parser.add_argument("--pixel_loss_keep_weight", type=float, default=1.0)
+    parser.add_argument("--pixel_loss_bref_weight", type=float, default=5.0)
+    parser.add_argument("--pixel_loss_gen_weight", type=float, default=2.0)
+    parser.add_argument("--use_bref_latent_residual", action="store_true", default=False)
+    parser.add_argument("--bref_latent_residual_weight", type=float, default=0.0)
+    parser.add_argument("--bref_latent_residual_use_soft_mask", action="store_true", default=False)
     return parser.parse_args()
 
 
@@ -207,6 +230,25 @@ def build_control_condition(batch, use_focus, zero_focus=False):
     return torch.cat(parts, dim=1)
 
 
+def laplacian(x):
+    kernel = x.new_tensor([[0, 1, 0], [1, -4, 1], [0, 1, 0]]).view(1, 1, 3, 3)
+    kernel = kernel.repeat(x.shape[1], 1, 1, 1)
+    return F.conv2d(x, kernel, padding=1, groups=x.shape[1])
+
+
+def maybe_downsample_pixel_loss(pred_image, target_image, weight, max_pixels):
+    height, width = pred_image.shape[-2:]
+    if max_pixels is None or max_pixels <= 0 or height * width <= max_pixels:
+        return pred_image, target_image, weight
+    scale = (max_pixels / float(height * width)) ** 0.5
+    new_h = max(1, int(height * scale))
+    new_w = max(1, int(width * scale))
+    pred_image = F.interpolate(pred_image, size=(new_h, new_w), mode="bilinear", align_corners=False)
+    target_image = F.interpolate(target_image, size=(new_h, new_w), mode="bilinear", align_corners=False)
+    weight = F.interpolate(weight, size=(new_h, new_w), mode="nearest")
+    return pred_image, target_image, weight
+
+
 def main():
     args = parse_args()
     if args.batch_size != 1:
@@ -236,6 +278,9 @@ def main():
     accelerator.print(f"[OUTPUT_DIR] {args.output_dir}", flush=True)
     accelerator.print(f"[MODEL] {args.model}", flush=True)
     accelerator.print(f"[DATASET_METADATA_PATH] {args.dataset_metadata_path}", flush=True)
+    accelerator.print(f"[USE_FOCUS_LOSS_WEIGHTING] {args.use_focus_loss_weighting}", flush=True)
+    accelerator.print(f"[USE_BREF_LATENT_RESIDUAL] {args.use_bref_latent_residual}", flush=True)
+    accelerator.print(f"[BREF_LATENT_RESIDUAL_WEIGHT] {args.bref_latent_residual_weight}", flush=True)
 
     pipe = SanaPipeline.from_pretrained(args.model, torch_dtype=dtype, **pretrained_kwargs(args))
     scheduler = FlowMatchEulerDiscreteScheduler.from_pretrained(args.model, subfolder="scheduler", **pretrained_kwargs(args))
@@ -315,13 +360,47 @@ def main():
                 with torch.no_grad():
                     gt_latents = encode_vae_latents(pipe.vae, batch["target"].to(accelerator.device, torch.float32))
                     a_latents = encode_vae_latents(pipe.vae, batch["cond_a"].to(accelerator.device, torch.float32))
+                    b_latents = None
+                    if args.use_bref_latent_residual and args.loss_mode == "legacy_a_noise_gt_velocity":
+                        b_latents = encode_vae_latents(pipe.vae, batch["cond_b"].to(accelerator.device, torch.float32))
                     prompt_embeds, prompt_mask, _, _ = pipe.encode_prompt(batch["prompts"], False, device=accelerator.device, clean_caption=False, max_sequence_length=300)
                     prompt_embeds = prompt_embeds.to(dtype)
                     noise = torch.randn_like(a_latents)
                     indices = torch.randint(0, scheduler.config.num_train_timesteps, (a_latents.shape[0],), device=accelerator.device)
                     timesteps = scheduler_timesteps[indices]
                     sigmas = scheduler_sigmas[indices].view(-1, 1, 1, 1).to(a_latents.dtype)
+                    valid_mask_latent = F.interpolate(batch["valid_mask"].to(accelerator.device), size=a_latents.shape[-2:], mode="nearest")
+                    mask_for_residual = None
+                    if args.use_focus_loss_weighting or args.use_bref_latent_residual or args.keep_consistency_loss_weight > 0:
+                        m_keep, m_bref, m_gen = build_focus_routing_masks(
+                            batch["focus_a"].to(accelerator.device),
+                            batch["focus_b"].to(accelerator.device),
+                            keep_threshold=args.keep_mask_threshold,
+                            bref_threshold=args.bref_mask_threshold,
+                            gamma=args.focus_mask_gamma,
+                            use_soft=args.use_soft_focus_masks,
+                            target_size=a_latents.shape[-2:],
+                            valid_mask=valid_mask_latent,
+                        )
+                        mask_for_residual = m_bref
+                    else:
+                        m_keep = valid_mask_latent
+                        m_bref = torch.zeros_like(valid_mask_latent)
+                        m_gen = torch.zeros_like(valid_mask_latent)
                     source_latents = a_latents if args.loss_mode == "legacy_a_noise_gt_velocity" else gt_latents
+                    if args.use_bref_latent_residual and args.loss_mode == "legacy_a_noise_gt_velocity" and b_latents is not None:
+                        if args.bref_latent_residual_use_soft_mask and not args.use_soft_focus_masks:
+                            _, mask_for_residual, _ = build_focus_routing_masks(
+                                batch["focus_a"].to(accelerator.device),
+                                batch["focus_b"].to(accelerator.device),
+                                keep_threshold=args.keep_mask_threshold,
+                                bref_threshold=args.bref_mask_threshold,
+                                gamma=args.focus_mask_gamma,
+                                use_soft=True,
+                                target_size=a_latents.shape[-2:],
+                                valid_mask=valid_mask_latent,
+                            )
+                        source_latents = a_latents + args.bref_latent_residual_weight * mask_for_residual.to(a_latents) * (b_latents - a_latents)
                     noisy_latents = (1 - sigmas) * source_latents + sigmas * noise
                     target = noise - gt_latents
                 control = build_control_condition(batch, args.use_focus_conditions, args.zero_focus_conditions).to(accelerator.device)
@@ -335,7 +414,59 @@ def main():
                 ).float()
                 error = pred - target.float()
                 valid_mask = F.interpolate(batch["valid_mask"].to(accelerator.device), size=error.shape[-2:], mode="nearest")
-                loss = (error.square() * valid_mask).sum() / (valid_mask.sum() * error.shape[1]).clamp_min(1)
+                if args.use_focus_loss_weighting:
+                    weight = (
+                        args.keep_loss_weight * m_keep
+                        + args.bref_loss_weight * m_bref
+                        + args.gen_loss_weight * m_gen
+                    ).to(error)
+                    loss_flow = weighted_mean(error.square(), weight)
+                else:
+                    weight = valid_mask.to(error)
+                    loss_flow = (error.square() * valid_mask).sum() / (valid_mask.sum() * error.shape[1]).clamp_min(1)
+                loss = loss_flow
+                x0_pred = None
+                loss_x0 = None
+                loss_keep = None
+                loss_pixel = None
+                if args.x0_loss_weight > 0 or args.keep_consistency_loss_weight > 0 or args.pixel_loss_weight > 0:
+                    x0_pred = noise.float() - pred.float()
+                if args.x0_loss_weight > 0:
+                    x0_error = (x0_pred - gt_latents.float()).abs() if args.x0_loss_type == "l1" else (x0_pred - gt_latents.float()).square()
+                    loss_x0 = weighted_mean(x0_error, weight if args.use_focus_loss_weighting else valid_mask)
+                    loss = loss + args.x0_loss_weight * loss_x0
+                if args.keep_consistency_loss_weight > 0:
+                    keep_target = a_latents.float() if args.keep_consistency_target == "a_latent" else gt_latents.float()
+                    loss_keep = weighted_mean((x0_pred - keep_target).abs(), m_keep)
+                    loss = loss + args.keep_consistency_loss_weight * loss_keep
+                if args.pixel_loss_weight > 0 and args.pixel_loss_every_n_steps > 0 and global_step % args.pixel_loss_every_n_steps == 0:
+                    if args.pixel_loss_type == "l1_lap":
+                        warnings.warn("--pixel_loss_type l1_lap enabled; using L1 + 0.1 * Laplacian L1.")
+                    pred_image = decode_vae_latents(pipe.vae, x0_pred.to(torch.float32))
+                    target_image = batch["target"].to(accelerator.device, torch.float32)
+                    m_keep_img, m_bref_img, m_gen_img = build_focus_routing_masks(
+                        batch["focus_a"].to(accelerator.device),
+                        batch["focus_b"].to(accelerator.device),
+                        keep_threshold=args.keep_mask_threshold,
+                        bref_threshold=args.bref_mask_threshold,
+                        gamma=args.focus_mask_gamma,
+                        use_soft=args.use_soft_focus_masks,
+                        target_size=target_image.shape[-2:],
+                        valid_mask=batch["valid_mask"].to(accelerator.device),
+                    )
+                    pixel_weight = (
+                        args.pixel_loss_keep_weight * m_keep_img
+                        + args.pixel_loss_bref_weight * m_bref_img
+                        + args.pixel_loss_gen_weight * m_gen_img
+                    )
+                    pred_image, target_image, pixel_weight = maybe_downsample_pixel_loss(
+                        pred_image, target_image, pixel_weight, args.pixel_loss_max_pixels
+                    )
+                    pixel_error = (pred_image.float() - target_image.float()).abs()
+                    if args.pixel_loss_type == "l1_lap":
+                        pixel_error = pixel_error + 0.1 * (laplacian(pred_image.float()) - laplacian(target_image.float())).abs()
+                    loss_pixel = weighted_mean(pixel_error, pixel_weight)
+                    loss = loss + args.pixel_loss_weight * loss_pixel
                 accelerator.backward(loss)
                 grad = None
                 for p in accelerator.unwrap_model(model).controlnet.parameters():
@@ -352,10 +483,25 @@ def main():
             if accelerator.sync_gradients:
                 global_step += 1
                 if accelerator.is_main_process and (global_step <= 5 or global_step % args.log_steps == 0):
-                    print(f"step={global_step} loss={loss.detach().item():.6f}", flush=True)
+                    print(f"step={global_step} loss_total={loss.detach().item():.6f} loss_flow={loss_flow.detach().item():.6f}", flush=True)
+                    means = mask_means(m_keep, m_bref, m_gen)
+                    source_delta_mean = float((source_latents - a_latents).detach().float().abs().mean().cpu())
+                    bref_latent_mean = None if mask_for_residual is None else float(mask_for_residual.detach().float().mean().cpu())
                     print(json.dumps({
+                        "loss_total": float(loss.detach().cpu()),
+                        "loss_flow": float(loss_flow.detach().cpu()),
+                        "loss_x0": None if loss_x0 is None else float(loss_x0.detach().cpu()),
+                        "loss_keep": None if loss_keep is None else float(loss_keep.detach().cpu()),
+                        "loss_pixel": None if loss_pixel is None else float(loss_pixel.detach().cpu()),
+                        **means,
+                        "use_focus_loss_weighting": args.use_focus_loss_weighting,
+                        "use_bref_latent_residual": args.use_bref_latent_residual,
+                        "bref_latent_residual_weight": args.bref_latent_residual_weight,
+                        "source_delta_mean": source_delta_mean,
+                        "bref_latent_mean": bref_latent_mean,
                         "timestep": tensor_stats(timesteps),
                         "A_latents": tensor_stats(a_latents),
+                        "B_latents": None if b_latents is None else tensor_stats(b_latents),
                         "GT_latents": tensor_stats(gt_latents),
                         "noisy_latents": tensor_stats(noisy_latents),
                         "target": tensor_stats(target),
@@ -372,6 +518,8 @@ def main():
                     ckpt.mkdir(parents=True, exist_ok=True)
                     unwrapped.controlnet.save_pretrained(ckpt / "controlnet")
                     save_file({k: v.detach().cpu() for k, v in unwrapped.condition_projection.state_dict().items()}, ckpt / "condition_projection.safetensors")
+                    if args.train_transformer_lora:
+                        SanaPipeline.save_lora_weights(ckpt / "transformer_lora", transformer_lora_layers=get_peft_model_state_dict(unwrapped.transformer))
                     (ckpt / "controlnet_ab_config.json").write_text(json.dumps(vars(args), indent=2, ensure_ascii=False), encoding="utf-8")
                 if global_step >= args.max_train_steps:
                     break

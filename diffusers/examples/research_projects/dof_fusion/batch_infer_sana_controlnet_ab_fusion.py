@@ -46,6 +46,12 @@ def parse_args():
     parser.add_argument("--steps", type=int, default=20)
     parser.add_argument("--guidance_scale", type=float, default=10.0)
     parser.add_argument("--conditioning_scale", type=float, default=1.0)
+    parser.add_argument("--use_bref_latent_residual", action="store_true", default=False)
+    parser.add_argument("--bref_latent_residual_weight", type=float, default=0.0)
+    parser.add_argument("--keep_mask_threshold", type=float, default=0.55)
+    parser.add_argument("--bref_mask_threshold", type=float, default=0.35)
+    parser.add_argument("--focus_mask_gamma", type=float, default=1.0)
+    parser.add_argument("--use_soft_focus_masks", action="store_true", default=False)
     parser.add_argument("--seed", type=int, default=0)
     return parser.parse_args()
 
@@ -86,7 +92,7 @@ def main():
                 args.downscale_if_exceeds_max_pixels,
             )
             canvas_w, canvas_h = size_info["canvas_size"]
-            control_condition, _, _ = build_condition(pipe, prepared, focus_a, focus_b, size_info, args)
+            control_condition, focus_a_tensor, focus_b_tensor = build_condition(pipe, prepared, focus_a, focus_b, size_info, args)
             generator = torch.Generator(device="cuda").manual_seed(int(record.get(args.seed_key, args.seed + index)))
             image, _, _ = generate(
                 pipe,
@@ -104,6 +110,15 @@ def main():
                 args.img2img_schedule_mode,
                 generator,
                 args.conditioning_scale,
+                image_b=prepared["b"],
+                focus_a_tensor=None if (focus_a is None or args.zero_focus_conditions) else focus_a_tensor,
+                focus_b_tensor=None if (focus_b is None or args.zero_focus_conditions) else focus_b_tensor,
+                use_bref_latent_residual=args.use_bref_latent_residual,
+                bref_latent_residual_weight=args.bref_latent_residual_weight,
+                keep_mask_threshold=args.keep_mask_threshold,
+                bref_mask_threshold=args.bref_mask_threshold,
+                focus_mask_gamma=args.focus_mask_gamma,
+                use_soft_focus_masks=args.use_soft_focus_masks,
             )
             output.parent.mkdir(parents=True, exist_ok=True)
             restore_output_size(image, size_info, args.restore_to_original_size).save(output)

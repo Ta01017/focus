@@ -44,6 +44,28 @@ IMAGE_B=${IMAGE_B:-${TRAIN_BASE}/b.png}
 FOCUS_A=${FOCUS_A:-}
 FOCUS_B=${FOCUS_B:-}
 DEBUG_LATENT_DIR=${DEBUG_LATENT_DIR:-}
+USE_FOCUS_LOSS_WEIGHTING=${USE_FOCUS_LOSS_WEIGHTING:-0}
+KEEP_LOSS_WEIGHT=${KEEP_LOSS_WEIGHT:-1.0}
+BREF_LOSS_WEIGHT=${BREF_LOSS_WEIGHT:-5.0}
+GEN_LOSS_WEIGHT=${GEN_LOSS_WEIGHT:-2.0}
+FOCUS_MASK_GAMMA=${FOCUS_MASK_GAMMA:-1.0}
+KEEP_MASK_THRESHOLD=${KEEP_MASK_THRESHOLD:-0.55}
+BREF_MASK_THRESHOLD=${BREF_MASK_THRESHOLD:-0.35}
+USE_SOFT_FOCUS_MASKS=${USE_SOFT_FOCUS_MASKS:-0}
+X0_LOSS_WEIGHT=${X0_LOSS_WEIGHT:-0.0}
+X0_LOSS_TYPE=${X0_LOSS_TYPE:-l1}
+KEEP_CONSISTENCY_LOSS_WEIGHT=${KEEP_CONSISTENCY_LOSS_WEIGHT:-0.0}
+KEEP_CONSISTENCY_TARGET=${KEEP_CONSISTENCY_TARGET:-a_latent}
+PIXEL_LOSS_WEIGHT=${PIXEL_LOSS_WEIGHT:-0.0}
+PIXEL_LOSS_TYPE=${PIXEL_LOSS_TYPE:-l1}
+PIXEL_LOSS_EVERY_N_STEPS=${PIXEL_LOSS_EVERY_N_STEPS:-1}
+PIXEL_LOSS_MAX_PIXELS=${PIXEL_LOSS_MAX_PIXELS:-524288}
+PIXEL_LOSS_KEEP_WEIGHT=${PIXEL_LOSS_KEEP_WEIGHT:-1.0}
+PIXEL_LOSS_BREF_WEIGHT=${PIXEL_LOSS_BREF_WEIGHT:-5.0}
+PIXEL_LOSS_GEN_WEIGHT=${PIXEL_LOSS_GEN_WEIGHT:-2.0}
+USE_BREF_LATENT_RESIDUAL=${USE_BREF_LATENT_RESIDUAL:-0}
+BREF_LATENT_RESIDUAL_WEIGHT=${BREF_LATENT_RESIDUAL_WEIGHT:-0.0}
+BREF_LATENT_RESIDUAL_USE_SOFT_MASK=${BREF_LATENT_RESIDUAL_USE_SOFT_MASK:-0}
 
 pretrained_args=()
 if [[ "${LOCAL_FILES_ONLY}" == "1" ]]; then
@@ -77,6 +99,50 @@ if [[ "${TRAIN_TRANSFORMER_LORA}" == "1" ]]; then
   train_extra_args+=(--lora_alpha "${LORA_ALPHA}")
   train_extra_args+=(--lora_target_modules "${LORA_TARGET_MODULES}")
 fi
+focus_repair_train_args=(
+  --keep_loss_weight "${KEEP_LOSS_WEIGHT}"
+  --bref_loss_weight "${BREF_LOSS_WEIGHT}"
+  --gen_loss_weight "${GEN_LOSS_WEIGHT}"
+  --focus_mask_gamma "${FOCUS_MASK_GAMMA}"
+  --keep_mask_threshold "${KEEP_MASK_THRESHOLD}"
+  --bref_mask_threshold "${BREF_MASK_THRESHOLD}"
+  --x0_loss_weight "${X0_LOSS_WEIGHT}"
+  --x0_loss_type "${X0_LOSS_TYPE}"
+  --keep_consistency_loss_weight "${KEEP_CONSISTENCY_LOSS_WEIGHT}"
+  --keep_consistency_target "${KEEP_CONSISTENCY_TARGET}"
+  --pixel_loss_weight "${PIXEL_LOSS_WEIGHT}"
+  --pixel_loss_type "${PIXEL_LOSS_TYPE}"
+  --pixel_loss_every_n_steps "${PIXEL_LOSS_EVERY_N_STEPS}"
+  --pixel_loss_max_pixels "${PIXEL_LOSS_MAX_PIXELS}"
+  --pixel_loss_keep_weight "${PIXEL_LOSS_KEEP_WEIGHT}"
+  --pixel_loss_bref_weight "${PIXEL_LOSS_BREF_WEIGHT}"
+  --pixel_loss_gen_weight "${PIXEL_LOSS_GEN_WEIGHT}"
+  --bref_latent_residual_weight "${BREF_LATENT_RESIDUAL_WEIGHT}"
+)
+if [[ "${USE_FOCUS_LOSS_WEIGHTING}" == "1" ]]; then
+  focus_repair_train_args+=(--use_focus_loss_weighting)
+fi
+if [[ "${USE_SOFT_FOCUS_MASKS}" == "1" ]]; then
+  focus_repair_train_args+=(--use_soft_focus_masks)
+fi
+if [[ "${USE_BREF_LATENT_RESIDUAL}" == "1" ]]; then
+  focus_repair_train_args+=(--use_bref_latent_residual)
+fi
+if [[ "${BREF_LATENT_RESIDUAL_USE_SOFT_MASK}" == "1" ]]; then
+  focus_repair_train_args+=(--bref_latent_residual_use_soft_mask)
+fi
+focus_repair_infer_args=(
+  --bref_latent_residual_weight "${BREF_LATENT_RESIDUAL_WEIGHT}"
+  --keep_mask_threshold "${KEEP_MASK_THRESHOLD}"
+  --bref_mask_threshold "${BREF_MASK_THRESHOLD}"
+  --focus_mask_gamma "${FOCUS_MASK_GAMMA}"
+)
+if [[ "${USE_BREF_LATENT_RESIDUAL}" == "1" ]]; then
+  focus_repair_infer_args+=(--use_bref_latent_residual)
+fi
+if [[ "${USE_SOFT_FOCUS_MASKS}" == "1" ]]; then
+  focus_repair_infer_args+=(--use_soft_focus_masks)
+fi
 
 echo "[MODE] ${MODE}"
 echo "[LOSS_MODE] ${LOSS_MODE}"
@@ -103,6 +169,12 @@ echo "[TRAIN_TRANSFORMER_LORA] ${TRAIN_TRANSFORMER_LORA}"
 echo "[LORA_RANK] ${LORA_RANK}"
 echo "[LORA_ALPHA] ${LORA_ALPHA}"
 echo "[LORA_TARGET_MODULES] ${LORA_TARGET_MODULES}"
+echo "[USE_FOCUS_LOSS_WEIGHTING] ${USE_FOCUS_LOSS_WEIGHTING}"
+echo "[X0_LOSS_WEIGHT] ${X0_LOSS_WEIGHT}"
+echo "[KEEP_CONSISTENCY_LOSS_WEIGHT] ${KEEP_CONSISTENCY_LOSS_WEIGHT}"
+echo "[PIXEL_LOSS_WEIGHT] ${PIXEL_LOSS_WEIGHT}"
+echo "[USE_BREF_LATENT_RESIDUAL] ${USE_BREF_LATENT_RESIDUAL}"
+echo "[BREF_LATENT_RESIDUAL_WEIGHT] ${BREF_LATENT_RESIDUAL_WEIGHT}"
 
 run_train() {
   accelerate launch --num_processes 1 --mixed_precision "${MIXED_PRECISION}" \
@@ -126,6 +198,7 @@ run_train() {
     "${focus_args[@]}" \
     "${size_args[@]}" \
     "${train_extra_args[@]}" \
+    "${focus_repair_train_args[@]}" \
     "${sample_args[@]}" \
     "${pretrained_args[@]}"
 }
@@ -146,6 +219,7 @@ run_infer() {
     --conditioning_scale "${CONDITIONING_SCALE}" \
     "${infer_focus_args[@]}" \
     "${size_args[@]}" \
+    "${focus_repair_infer_args[@]}" \
     "${debug_args[@]}" \
     "${pretrained_args[@]}"
 }
@@ -162,6 +236,7 @@ run_batch() {
     --max_pixels "${MAX_PIXELS}" \
     --conditioning_scale "${CONDITIONING_SCALE}" \
     "${size_args[@]}" \
+    "${focus_repair_infer_args[@]}" \
     "${debug_args[@]}" \
     "${pretrained_args[@]}"
 }

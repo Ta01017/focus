@@ -2,6 +2,7 @@
 
 import argparse
 import json
+import warnings
 from pathlib import Path
 
 import numpy as np
@@ -13,6 +14,7 @@ from torch.nn import functional as F
 from diffusers import SanaControlNetModel, SanaPipeline
 
 from dof_utils import add_pretrained_args, prepare_inference_images, pretrained_kwargs, restore_output_size
+from focus_routing_utils import build_focus_routing_masks
 from infer_sana_ab_adapter import decode_latents_to_pil, encode_image_latents
 from sana_dof import tensor_stats
 from train_sana_controlnet_ab_fusion import ControlConditionProjection
@@ -50,6 +52,12 @@ def parse_args():
     parser.add_argument("--steps", type=int, default=20)
     parser.add_argument("--guidance_scale", type=float, default=10.0)
     parser.add_argument("--conditioning_scale", type=float, default=1.0)
+    parser.add_argument("--use_bref_latent_residual", action="store_true", default=False)
+    parser.add_argument("--bref_latent_residual_weight", type=float, default=0.0)
+    parser.add_argument("--keep_mask_threshold", type=float, default=0.55)
+    parser.add_argument("--bref_mask_threshold", type=float, default=0.35)
+    parser.add_argument("--focus_mask_gamma", type=float, default=1.0)
+    parser.add_argument("--use_soft_focus_masks", action="store_true", default=False)
     parser.add_argument("--seed", type=int, default=0)
     add_pretrained_args(parser)
     return parser.parse_args()
@@ -83,17 +91,52 @@ def load_pipeline(checkpoint, model, dtype, options):
     model_id = model or config["model"]
     pipe = SanaPipeline.from_pretrained(model_id, torch_dtype=dtype, **options).to("cuda")
     pipe.vae.to(dtype=torch.float32)
+    print(f"[LOAD] controlnet: {checkpoint / 'controlnet'}", flush=True)
     controlnet = SanaControlNetModel.from_pretrained(checkpoint / "controlnet", torch_dtype=dtype, **options).to("cuda")
+    print(f"[LOAD] condition_projection: {checkpoint / 'condition_projection.safetensors'}", flush=True)
     projection = ControlConditionProjection(config["control_condition_channels"], pipe.transformer.config.in_channels)
     projection.load_state_dict(load_file(checkpoint / "condition_projection.safetensors"))
     projection.to("cuda", dtype=torch.float32).eval()
+    lora_path = None
     if (checkpoint / "transformer_lora").exists():
-        pipe.load_lora_weights(checkpoint / "transformer_lora")
+        lora_path = checkpoint / "transformer_lora"
+    elif (checkpoint.parent / "transformer_lora").exists():
+        lora_path = checkpoint.parent / "transformer_lora"
+    if lora_path is not None:
+        print(f"[LOAD] transformer LoRA: {lora_path}", flush=True)
+        pipe.load_lora_weights(lora_path)
+    else:
+        print(f"[WARN] transformer LoRA not found: {checkpoint}", flush=True)
     return pipe, controlnet, projection, config
 
 
 @torch.no_grad()
-def generate(pipe, controlnet, projection, prompt, negative_prompt, image_a, control_condition, height, width, steps, guidance_scale, strength, mode, generator, conditioning_scale):
+def generate(
+    pipe,
+    controlnet,
+    projection,
+    prompt,
+    negative_prompt,
+    image_a,
+    control_condition,
+    height,
+    width,
+    steps,
+    guidance_scale,
+    strength,
+    mode,
+    generator,
+    conditioning_scale,
+    image_b=None,
+    focus_a_tensor=None,
+    focus_b_tensor=None,
+    use_bref_latent_residual=False,
+    bref_latent_residual_weight=0.0,
+    keep_mask_threshold=0.55,
+    bref_mask_threshold=0.35,
+    focus_mask_gamma=1.0,
+    use_soft_focus_masks=False,
+):
     device = torch.device("cuda")
     pipe._guidance_scale = guidance_scale
     do_cfg = guidance_scale > 1.0
@@ -114,15 +157,37 @@ def generate(pipe, controlnet, projection, prompt, negative_prompt, image_a, con
             pipe.scheduler.set_begin_index(begin_index)
         sigma = pipe.scheduler.sigmas[t_start].to(device=device, dtype=torch.float32).reshape(1, 1, 1, 1)
         a_latents = encode_image_latents(pipe, image_a, height, width, device)
+        source_latents = a_latents
+        residual_enabled = False
+        m_bref = None
+        if use_bref_latent_residual:
+            if image_b is None or focus_a_tensor is None or focus_b_tensor is None:
+                warnings.warn("--use_bref_latent_residual requested but B/focus inputs are missing; falling back to A latent init.")
+            else:
+                b_latents = encode_image_latents(pipe, image_b, height, width, device)
+                _, m_bref, _ = build_focus_routing_masks(
+                    focus_a_tensor.to(device).unsqueeze(0),
+                    focus_b_tensor.to(device).unsqueeze(0),
+                    keep_threshold=keep_mask_threshold,
+                    bref_threshold=bref_mask_threshold,
+                    gamma=focus_mask_gamma,
+                    use_soft=use_soft_focus_masks,
+                    target_size=a_latents.shape[-2:],
+                )
+                source_latents = a_latents + bref_latent_residual_weight * m_bref.to(a_latents) * (b_latents - a_latents)
+                residual_enabled = True
         noise = torch.randn(a_latents.shape, generator=generator, device=device, dtype=a_latents.dtype)
-        latents = (1 - sigma.to(a_latents)) * a_latents + sigma.to(a_latents) * noise
+        latents = (1 - sigma.to(a_latents)) * source_latents + sigma.to(a_latents) * noise
     else:
         sliced = timesteps
         t_start = 0
         begin_index = 0
         a_latents = encode_image_latents(pipe, image_a, height, width, device)
+        source_latents = a_latents
+        residual_enabled = False
+        m_bref = None
         noise = torch.randn(a_latents.shape, generator=generator, device=device, dtype=a_latents.dtype)
-        latents = (1 - strength) * a_latents + strength * noise if strength > 0 else noise
+        latents = (1 - strength) * source_latents + strength * noise if strength > 0 else noise
         sigma = None
     control_condition = control_condition.to(device).float()
     control_condition_raw_shape = list(control_condition.shape)
@@ -176,8 +241,13 @@ def generate(pipe, controlnet, projection, prompt, negative_prompt, image_a, con
         "actual_num_denoise_steps": len(sliced),
         "scheduler_order": pipe.scheduler.order,
         "begin_index_value": begin_index,
-        "init_latents": tensor_stats(a_latents),
+        "init_latents": tensor_stats(source_latents),
+        "A_latents": tensor_stats(a_latents),
         "final_latents": tensor_stats(latents),
+        "use_bref_latent_residual": residual_enabled,
+        "bref_latent_residual_weight": bref_latent_residual_weight,
+        "bref_mask_mean": None if m_bref is None else float(m_bref.detach().float().mean().cpu()),
+        "source_delta_mean": float((source_latents - a_latents).detach().float().abs().mean().cpu()),
         "control_residual": final_residual_stats,
         "control_condition_raw_shape": control_condition_raw_shape,
         "control_condition_downsampled_shape": control_condition_downsampled_shape,
@@ -210,7 +280,16 @@ def main():
     generator = torch.Generator(device="cuda").manual_seed(args.seed)
     image, final_latents, stats = generate(
         pipe, controlnet, projection, args.prompt, args.negative_prompt, prepared["a"], control_condition, canvas_h, canvas_w,
-        args.steps, args.guidance_scale, args.strength if args.use_a_latent_init else 1.0, args.img2img_schedule_mode, generator, args.conditioning_scale
+        args.steps, args.guidance_scale, args.strength if args.use_a_latent_init else 1.0, args.img2img_schedule_mode, generator, args.conditioning_scale,
+        image_b=prepared["b"],
+        focus_a_tensor=None if (args.focus_a is None or args.zero_focus_conditions) else focus_a_tensor,
+        focus_b_tensor=None if (args.focus_b is None or args.zero_focus_conditions) else focus_b_tensor,
+        use_bref_latent_residual=args.use_bref_latent_residual,
+        bref_latent_residual_weight=args.bref_latent_residual_weight,
+        keep_mask_threshold=args.keep_mask_threshold,
+        bref_mask_threshold=args.bref_mask_threshold,
+        focus_mask_gamma=args.focus_mask_gamma,
+        use_soft_focus_masks=args.use_soft_focus_masks,
     )
     if args.debug_latent_dir:
         debug = Path(args.debug_latent_dir)
