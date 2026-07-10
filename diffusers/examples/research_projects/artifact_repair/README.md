@@ -636,3 +636,136 @@ CHECKPOINT=/data/vjuicefs_ai_camera_3drg_ql/public_data/11188633/focus/models/tr
 SWAP_SRC_REF=1 MAX_SAMPLES=20 \
 bash examples/research_projects/artifact_repair/run_sana_artifact_repair_native_edit_lora.sh
 ```
+
+## 15. Artifact Repair – Route 1: src latent concat / image-input injection
+
+Route 1 是 artifact repair 的独立正式路线，不使用 ControlNet，不使用 Adapter，不把图片 token 拼到 text/caption tokens 中，也不使用 native-edit v1 的 `H×3W` token 拼接。
+
+该路线的输入与训练目标如下：
+
+1. `image` / GT 经 VAE 编码，作为 clean target latent。
+2. clean target latent 加噪，得到 noisy target latent。
+3. `edit_image[0]` / src 经 VAE 编码，作为图像条件 latent。
+4. src latent 进入 `SrcLatentConditionInjector`，生成与 SANA image hidden tokens 同 shape 的 additive residual。
+5. additive residual 加到 noisy target latent 的 image token stream 上，再进入 SANA transformer blocks。
+6. transformer 输出仍然是 target latent 的 flow-matching 预测。
+7. `edit_image[1]` / ref 会从 metadata 读取并用于尺寸兼容检查，但当前 Route 1 不参与模型计算。
+
+实现入口：
+
+- `sana_artifact_repair_latent_concat.py`
+- `train_sana_artifact_repair_latent_concat_lora.py`
+- `infer_sana_artifact_repair_latent_concat_lora.py`
+- `batch_infer_sana_artifact_repair_latent_concat_lora.py`
+- `run_sana_artifact_repair_latent_concat_lora.sh`
+
+保存内容：
+
+- `src_condition_injector.safetensors`
+- `transformer_lora/`，如果开启 transformer LoRA
+- `route1_config.json`
+- `artifact_repair_config.json`
+
+关键默认设置：
+
+- `MIXED_PRECISION=no`，优先保证 fp32 稳定。
+- `TRAIN_TRANSFORMER_LORA=1`
+- `LORA_SCOPE=wide`
+- `USE_SRC_LATENT_INIT=1`
+- `IMG2IMG_SCHEDULE_MODE=sliced`
+- `STRENGTH=0.15`
+
+### 15.1 tiny1 fp32 overfit
+
+```bash
+CUDA_VISIBLE_DEVICES=1 MODE=train \
+MIXED_PRECISION=no \
+ART_BASE=/data/vjuicefs_ai_camera_3drg_ql/public_data/11188633/dataset/obj-curated-v2-lora/data-prompt-aug \
+DATASET_METADATA_PATH=/data/vjuicefs_ai_camera_3drg_ql/public_data/11188633/dataset/obj-curated-v2-lora/data-prompt-aug/metadata_train.json \
+DATASET_BASE_PATH=/data/vjuicefs_ai_camera_3drg_ql/public_data/11188633/dataset/obj-curated-v2-lora/data-prompt-aug \
+OUTPUT_DIR=/data/vjuicefs_ai_camera_3drg_ql/public_data/11188633/focus/models/train/sana_artifact_repair/route1_tiny1_lora \
+MAX_SAMPLES=1 \
+MAX_TRAIN_STEPS=2000 \
+SAVE_STEPS=500 \
+LOG_STEPS=10 \
+LORA_RANK=8 \
+MAX_PIXELS=1048576 \
+DOWNSCALE_IF_EXCEEDS_MAX_PIXELS=1 \
+LOCAL_FILES_ONLY=1 \
+bash examples/research_projects/artifact_repair/run_sana_artifact_repair_latent_concat_lora.sh
+```
+
+### 15.2 tiny16 fp32 验证
+
+```bash
+CUDA_VISIBLE_DEVICES=1 MODE=train \
+MIXED_PRECISION=no \
+ART_BASE=/data/vjuicefs_ai_camera_3drg_ql/public_data/11188633/dataset/obj-curated-v2-lora/data-prompt-aug \
+DATASET_METADATA_PATH=/data/vjuicefs_ai_camera_3drg_ql/public_data/11188633/dataset/obj-curated-v2-lora/data-prompt-aug/metadata_train.json \
+DATASET_BASE_PATH=/data/vjuicefs_ai_camera_3drg_ql/public_data/11188633/dataset/obj-curated-v2-lora/data-prompt-aug \
+OUTPUT_DIR=/data/vjuicefs_ai_camera_3drg_ql/public_data/11188633/focus/models/train/sana_artifact_repair/route1_tiny16_lora \
+MAX_SAMPLES=16 \
+MAX_TRAIN_STEPS=5000 \
+SAVE_STEPS=1000 \
+LOG_STEPS=10 \
+LORA_RANK=16 \
+MAX_PIXELS=1048576 \
+DOWNSCALE_IF_EXCEEDS_MAX_PIXELS=1 \
+LOCAL_FILES_ONLY=1 \
+bash examples/research_projects/artifact_repair/run_sana_artifact_repair_latent_concat_lora.sh
+```
+
+### 15.3 单图推理
+
+```bash
+CUDA_VISIBLE_DEVICES=1 MODE=infer \
+DTYPE=fp32 \
+CHECKPOINT=/data/vjuicefs_ai_camera_3drg_ql/public_data/11188633/focus/models/train/sana_artifact_repair/route1_tiny1_lora/checkpoint-2000 \
+IMAGE_SRC=/path/to/src.png \
+IMAGE_REF=/path/to/ref.png \
+OUTPUT=/tmp/route1_single.png \
+USE_SRC_LATENT_INIT=1 \
+IMG2IMG_SCHEDULE_MODE=sliced \
+STRENGTH=0.15 \
+STEPS=20 \
+MAX_PIXELS=1048576 \
+DOWNSCALE_IF_EXCEEDS_MAX_PIXELS=1 \
+LOCAL_FILES_ONLY=1 \
+bash examples/research_projects/artifact_repair/run_sana_artifact_repair_latent_concat_lora.sh
+```
+
+### 15.4 batch 推理
+
+```bash
+CUDA_VISIBLE_DEVICES=1 MODE=batch_infer \
+DTYPE=fp32 \
+CHECKPOINT=/data/vjuicefs_ai_camera_3drg_ql/public_data/11188633/focus/models/train/sana_artifact_repair/route1_tiny16_lora/checkpoint-5000 \
+ART_BASE=/data/vjuicefs_ai_camera_3drg_ql/public_data/11188633/dataset/obj-curated-v2-lora/data-prompt-aug \
+TEST_METADATA_PATH=/data/vjuicefs_ai_camera_3drg_ql/public_data/11188633/dataset/obj-curated-v2-lora/data-prompt-aug/metadata_test.json \
+DATASET_BASE_PATH=/data/vjuicefs_ai_camera_3drg_ql/public_data/11188633/dataset/obj-curated-v2-lora/data-prompt-aug \
+OUTPUT_DIR=/data/vjuicefs_ai_camera_3drg_ql/public_data/11188633/focus/models/train/sana_artifact_repair/route1_tiny16_lora \
+USE_SRC_LATENT_INIT=1 \
+IMG2IMG_SCHEDULE_MODE=sliced \
+STRENGTH=0.15 \
+STEPS=20 \
+MAX_SAMPLES=20 \
+MAX_PIXELS=1048576 \
+DOWNSCALE_IF_EXCEEDS_MAX_PIXELS=1 \
+LOCAL_FILES_ONLY=1 \
+bash examples/research_projects/artifact_repair/run_sana_artifact_repair_latent_concat_lora.sh
+```
+
+### 15.5 Route 1 ablation
+
+关闭 src latent 初始化时，src 仍然作为 injector 条件输入；区别只是初始 latent 从随机噪声开始。
+
+```bash
+CUDA_VISIBLE_DEVICES=1 MODE=batch_infer \
+DTYPE=fp32 \
+CHECKPOINT=/data/vjuicefs_ai_camera_3drg_ql/public_data/11188633/focus/models/train/sana_artifact_repair/route1_tiny16_lora/checkpoint-5000 \
+USE_SRC_LATENT_INIT=0 \
+IMG2IMG_SCHEDULE_MODE=sliced \
+STRENGTH=0.15 \
+MAX_SAMPLES=20 \
+bash examples/research_projects/artifact_repair/run_sana_artifact_repair_latent_concat_lora.sh
+```

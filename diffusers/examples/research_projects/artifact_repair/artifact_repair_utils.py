@@ -35,7 +35,19 @@ def resolve_path(base, path):
     path = Path(path)
     if path.is_absolute():
         return path
-    return Path(base) / path
+    base = Path(base)
+    direct = base / path
+    if direct.exists():
+        return direct
+    base_parts = base.parts
+    path_parts = path.parts
+    max_overlap = min(len(base_parts), len(path_parts))
+    for overlap in range(max_overlap, 0, -1):
+        if base_parts[-overlap:] == path_parts[:overlap]:
+            deduped = base.joinpath(*path_parts[overlap:])
+            if deduped.exists():
+                return deduped
+    return direct
 
 
 def load_rgb(path):
