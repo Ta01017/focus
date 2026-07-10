@@ -19,7 +19,7 @@ from artifact_repair_utils import (
     select_records,
     write_json,
 )
-from infer_sana_artifact_repair_native_edit_lora import generate, load_pipeline
+from infer_sana_artifact_repair_native_edit_lora import generate, load_pipeline, select_dtype
 
 
 def parse_args():
@@ -37,6 +37,7 @@ def parse_args():
     parser.add_argument("--seed", type=int, default=0)
     parser.add_argument("--init_mode", choices=("noise", "src"), default="src")
     parser.add_argument("--strength", type=float, default=0.15)
+    parser.add_argument("--dtype", choices=("fp32", "bf16", "fp16", "auto"), default="auto")
     parser.add_argument("--max_pixels", type=int, default=1048576)
     parser.add_argument("--size_divisor", type=int, default=32)
     parser.add_argument("--downscale_if_exceeds_max_pixels", action="store_true")
@@ -61,7 +62,7 @@ def main():
         raise ValueError("Dynamic batch inference currently supports --batch_size 1.")
     if not torch.cuda.is_available():
         raise RuntimeError("CUDA is required.")
-    dtype = torch.bfloat16 if torch.cuda.is_bf16_supported() else torch.float16
+    dtype = select_dtype(args.dtype)
     pipe, native_transformer, _ = load_pipeline(args, dtype)
     records = select_records(load_metadata(args.dataset_metadata_path), args.start_index, args.max_samples)
     output_dir = Path(args.output_dir)
@@ -80,6 +81,7 @@ def main():
             paths = get_artifact_repair_paths(sample, args.dataset_base_path, index)
             src = load_rgb(paths["src"])
             ref = load_rgb(paths["ref"])
+            init_src = src.copy()
             prompt = paths["prompt"] or DEFAULT_REPAIR_PROMPT
             if args.swap_src_ref:
                 src, ref = ref, src
@@ -88,6 +90,8 @@ def main():
             if args.zero_ref:
                 ref = Image.new("RGB", ref.size, (0, 0, 0))
             prepared, size_info = preprocess_pair(src, ref, args.max_pixels, args.size_divisor, args.downscale_if_exceeds_max_pixels)
+            if init_src.size != prepared["src"].size:
+                init_src = init_src.resize(prepared["src"].size, Image.Resampling.BICUBIC)
             canvas_w, canvas_h = size_info["canvas_size"]
             generator = torch.Generator(device="cuda").manual_seed(args.seed + index)
             image = generate(
@@ -104,6 +108,7 @@ def main():
                 args.init_mode,
                 args.strength,
                 generator,
+                init_image=init_src,
             )
             image = restore_output_size(image, size_info, args.restore_to_original_size)
             out.parent.mkdir(parents=True, exist_ok=True)

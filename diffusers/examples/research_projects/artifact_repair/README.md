@@ -454,40 +454,32 @@ ControlNet 路线：
 - `zero_ref` / `zero_src` 对照实验：设置 `ZERO_REF_CONDITION=1` 或 `ZERO_SRC_CONDITION=1`。如果输出完全不变，说明对应条件可能没有被有效使用。
 - `pipeline_full` 与 `sliced` 区别：`pipeline_full` 仅保留为 debug；`sliced` 能让初始 latent 噪声等级和实际 denoising timesteps 对齐，是当前默认推荐。
 
-## 14. SANA Native Edit LoRA for Artifact Repair
+## 14. SANA Native Edit LoRA for Artifact Repair（cross-attention v2）
 
 Native Edit LoRA 是一条独立路线，不使用 ControlNet，也不使用 Adapter。它参考 DiffSynth-Studio FLUX2 的 `edit_image` LoRA 训练范式，但模型仍然是 SANA。
 
-训练逻辑：
+重要：旧版 v1 的 `target/src/ref` 在 image stream 维度拼成 `H×3W` 已废弃。SANA block 内部有 GLUMBConv / spatial reshape，真实 image stream 必须保持 target 的 `H×W`，否则容易出现 token reshape 或卷积语义错误。
+
+当前 v2 逻辑：
 
 1. `image` / GT 作为 clean diffusion target。
 2. `edit_image[0]` 固定为 `src`。
 3. `edit_image[1]` 固定为 `ref`。
 4. GT、src、ref 分别经过 VAE 编码为 latent。
-5. GT noisy latent token、src edit token、ref edit token 在 sequence 维度拼接。
-6. 拼接后的 tokens 进入 SANA Transformer 原有 attention。
-7. 输出时只取 target token 部分计算 diffusion loss。
+5. noisy GT latent 只作为 SANA 的 target hidden/query stream，空间网格始终保持真实 `H×W`。
+6. src/ref latent 经过 SANA 共享 `patch_embed`，加 role embedding，再可选 token norm / projection。
+7. src/ref tokens 拼到 text encoder condition 后面，作为 cross-attention 的 K/V 条件。
+8. 输出只有 target stream，不再做 target token slicing。
 
-对比已有路线：
+因此推理和训练都会保存并检查：
 
-- ControlNet 路线：`src/ref -> condition network -> residual feature -> SANA`
-- Native Edit LoRA 路线：`src/ref -> VAE latent tokens -> concat with target noisy tokens -> SANA Transformer -> target output`
+- `implementation=sana_cross_attention_edit_condition_v2`
+- `version=2`
+- `target_stream=target_only`
+- `edit_stream=cross_attention_encoder_condition`
+- `spatial_layout=target_HxW_only`
 
-优点：
-
-- 结构简单；
-- 参数少；
-- 不需要额外 ControlNet；
-- 更接近 edit_image LoRA 的训练方式；
-- 适合 artifact repair 这类输入输出关系相对直接的任务。
-
-风险：
-
-- token 数增加，显存会上升；
-- src/ref 角色必须固定；
-- prompt 中建议明确 Image 1 / Image 2 的语义；
-- 如果 `init_mode=noise` 不稳定，优先使用默认 `init_mode=src`；
-- role embedding 对区分 target/src/ref 很重要，默认开启。
+旧 v1 checkpoint 不兼容，加载时会直接报错，需要重新训练。
 
 新增入口：
 
@@ -506,14 +498,20 @@ ART_TEST_META=${ART_BASE}/metadata_test.json
 
 注意：`DATASET_BASE_PATH` 必须是 `${ART_BASE}`，不要传到 `processed/train` 或 `processed/test`，否则 metadata 中的相对路径会重复拼接。
 
-### 14.1 tiny1 overfit
+### 14.1 tiny1 fp32 overfit
 
 ```bash
 CUDA_VISIBLE_DEVICES=1 MODE=train \
+MIXED_PRECISION=no \
+NATIVE_EDIT_IMPL=cross_attention_v2 \
+LORA_SCOPE=cross_attention \
+EDIT_CONDITION_SCALE=1.0 \
+USE_EDIT_TOKEN_NORM=1 \
+DEBUG_NAN=1 \
 ART_BASE=/data/vjuicefs_ai_camera_3drg_ql/public_data/11188633/dataset/obj-curated-v2-lora/data-prompt-aug \
 DATASET_METADATA_PATH=/data/vjuicefs_ai_camera_3drg_ql/public_data/11188633/dataset/obj-curated-v2-lora/data-prompt-aug/metadata_train.json \
 DATASET_BASE_PATH=/data/vjuicefs_ai_camera_3drg_ql/public_data/11188633/dataset/obj-curated-v2-lora/data-prompt-aug \
-OUTPUT_DIR=/data/vjuicefs_ai_camera_3drg_ql/public_data/11188633/focus/models/train/sana_artifact_repair/native_edit_tiny1_lora \
+OUTPUT_DIR=/data/vjuicefs_ai_camera_3drg_ql/public_data/11188633/focus/models/train/sana_artifact_repair/native_edit_v2_tiny1_lora \
 MAX_SAMPLES=1 \
 MAX_TRAIN_STEPS=2000 \
 SAVE_STEPS=500 \
@@ -525,14 +523,20 @@ LOCAL_FILES_ONLY=1 \
 bash examples/research_projects/artifact_repair/run_sana_artifact_repair_native_edit_lora.sh
 ```
 
-### 14.2 tiny16 train
+### 14.2 tiny16 fp32 验证
 
 ```bash
 CUDA_VISIBLE_DEVICES=1 MODE=train \
+MIXED_PRECISION=no \
+NATIVE_EDIT_IMPL=cross_attention_v2 \
+LORA_SCOPE=cross_attention \
+EDIT_CONDITION_SCALE=1.0 \
+USE_EDIT_TOKEN_NORM=1 \
+DEBUG_NAN=1 \
 ART_BASE=/data/vjuicefs_ai_camera_3drg_ql/public_data/11188633/dataset/obj-curated-v2-lora/data-prompt-aug \
 DATASET_METADATA_PATH=/data/vjuicefs_ai_camera_3drg_ql/public_data/11188633/dataset/obj-curated-v2-lora/data-prompt-aug/metadata_train.json \
 DATASET_BASE_PATH=/data/vjuicefs_ai_camera_3drg_ql/public_data/11188633/dataset/obj-curated-v2-lora/data-prompt-aug \
-OUTPUT_DIR=/data/vjuicefs_ai_camera_3drg_ql/public_data/11188633/focus/models/train/sana_artifact_repair/native_edit_tiny16_lora \
+OUTPUT_DIR=/data/vjuicefs_ai_camera_3drg_ql/public_data/11188633/focus/models/train/sana_artifact_repair/native_edit_v2_tiny16_lora \
 MAX_SAMPLES=16 \
 MAX_TRAIN_STEPS=5000 \
 SAVE_STEPS=1000 \
@@ -550,10 +554,14 @@ bash examples/research_projects/artifact_repair/run_sana_artifact_repair_native_
 CUDA_VISIBLE_DEVICES=0,1,2,3 MODE=train \
 NUM_PROCESSES=4 \
 MIXED_PRECISION=bf16 \
+NATIVE_EDIT_IMPL=cross_attention_v2 \
+LORA_SCOPE=cross_attention \
+EDIT_CONDITION_SCALE=1.0 \
+USE_EDIT_TOKEN_NORM=1 \
 ART_BASE=/data/vjuicefs_ai_camera_3drg_ql/public_data/11188633/dataset/obj-curated-v2-lora/data-prompt-aug \
 DATASET_METADATA_PATH=/data/vjuicefs_ai_camera_3drg_ql/public_data/11188633/dataset/obj-curated-v2-lora/data-prompt-aug/metadata_train.json \
 DATASET_BASE_PATH=/data/vjuicefs_ai_camera_3drg_ql/public_data/11188633/dataset/obj-curated-v2-lora/data-prompt-aug \
-OUTPUT_DIR=/data/vjuicefs_ai_camera_3drg_ql/public_data/11188633/focus/models/train/sana_artifact_repair/native_edit_full_lora \
+OUTPUT_DIR=/data/vjuicefs_ai_camera_3drg_ql/public_data/11188633/focus/models/train/sana_artifact_repair/native_edit_v2_full_lora \
 MAX_TRAIN_STEPS=50000 \
 SAVE_STEPS=5000 \
 LOG_STEPS=10 \
@@ -564,15 +572,34 @@ LOCAL_FILES_ONLY=1 \
 bash examples/research_projects/artifact_repair/run_sana_artifact_repair_native_edit_lora.sh
 ```
 
-### 14.4 tiny infer
+### 14.4 单图推理
+
+```bash
+CUDA_VISIBLE_DEVICES=1 MODE=infer \
+DTYPE=fp32 \
+CHECKPOINT=/data/vjuicefs_ai_camera_3drg_ql/public_data/11188633/focus/models/train/sana_artifact_repair/native_edit_v2_tiny1_lora/checkpoint-2000 \
+SRC_IMAGE=/path/to/src.png \
+REF_IMAGE=/path/to/ref.png \
+OUTPUT_PATH=/tmp/native_edit_v2_single.png \
+INIT_MODE=src \
+STRENGTH=0.15 \
+STEPS=20 \
+MAX_PIXELS=1048576 \
+DOWNSCALE_IF_EXCEEDS_MAX_PIXELS=1 \
+LOCAL_FILES_ONLY=1 \
+bash examples/research_projects/artifact_repair/run_sana_artifact_repair_native_edit_lora.sh
+```
+
+### 14.5 batch 推理
 
 ```bash
 CUDA_VISIBLE_DEVICES=1 MODE=batch_infer \
-CHECKPOINT=/data/vjuicefs_ai_camera_3drg_ql/public_data/11188633/focus/models/train/sana_artifact_repair/native_edit_tiny1_lora/checkpoint-2000 \
+DTYPE=fp32 \
+CHECKPOINT=/data/vjuicefs_ai_camera_3drg_ql/public_data/11188633/focus/models/train/sana_artifact_repair/native_edit_v2_tiny1_lora/checkpoint-2000 \
 ART_BASE=/data/vjuicefs_ai_camera_3drg_ql/public_data/11188633/dataset/obj-curated-v2-lora/data-prompt-aug \
 TEST_METADATA_PATH=/data/vjuicefs_ai_camera_3drg_ql/public_data/11188633/dataset/obj-curated-v2-lora/data-prompt-aug/metadata_test.json \
 DATASET_BASE_PATH=/data/vjuicefs_ai_camera_3drg_ql/public_data/11188633/dataset/obj-curated-v2-lora/data-prompt-aug \
-OUTPUT_DIR=/data/vjuicefs_ai_camera_3drg_ql/public_data/11188633/focus/models/train/sana_artifact_repair/native_edit_tiny1_lora \
+OUTPUT_DIR=/data/vjuicefs_ai_camera_3drg_ql/public_data/11188633/focus/models/train/sana_artifact_repair/native_edit_v2_tiny1_lora \
 INIT_MODE=src \
 STRENGTH=0.15 \
 STEPS=20 \
@@ -583,49 +610,29 @@ LOCAL_FILES_ONLY=1 \
 bash examples/research_projects/artifact_repair/run_sana_artifact_repair_native_edit_lora.sh
 ```
 
-### 14.5 strength sweep
+### 14.6 ablation 推理
+
+`ZERO_SRC=1` 和 `ZERO_REF=1` 现在只清空 cross-attention 条件 tokens，不会改变 `INIT_MODE=src` 使用的初始化 latent。这样可以更干净地判断 src/ref 条件是否真的被模型使用。
 
 ```bash
-for S in 0.08 0.12 0.15 0.20 0.30; do
-  CUDA_VISIBLE_DEVICES=1 MODE=batch_infer \
-  CHECKPOINT=/data/vjuicefs_ai_camera_3drg_ql/public_data/11188633/focus/models/train/sana_artifact_repair/native_edit_tiny16_lora/checkpoint-5000 \
-  ART_BASE=/data/vjuicefs_ai_camera_3drg_ql/public_data/11188633/dataset/obj-curated-v2-lora/data-prompt-aug \
-  TEST_METADATA_PATH=/data/vjuicefs_ai_camera_3drg_ql/public_data/11188633/dataset/obj-curated-v2-lora/data-prompt-aug/metadata_test.json \
-  DATASET_BASE_PATH=/data/vjuicefs_ai_camera_3drg_ql/public_data/11188633/dataset/obj-curated-v2-lora/data-prompt-aug \
-  OUTPUT_DIR=/data/vjuicefs_ai_camera_3drg_ql/public_data/11188633/focus/models/train/sana_artifact_repair/native_edit_sweep_s${S} \
-  INIT_MODE=src \
-  STRENGTH=${S} \
-  STEPS=20 \
-  MAX_SAMPLES=20 \
-  LOCAL_FILES_ONLY=1 \
-  bash examples/research_projects/artifact_repair/run_sana_artifact_repair_native_edit_lora.sh
-done
-```
-
-### 14.6 ablation infer
-
-```bash
-# normal
+# zero src condition only
 CUDA_VISIBLE_DEVICES=1 MODE=batch_infer \
-CHECKPOINT=/data/vjuicefs_ai_camera_3drg_ql/public_data/11188633/focus/models/train/sana_artifact_repair/native_edit_tiny16_lora/checkpoint-5000 \
-MAX_SAMPLES=20 \
-bash examples/research_projects/artifact_repair/run_sana_artifact_repair_native_edit_lora.sh
-
-# zero src
-CUDA_VISIBLE_DEVICES=1 MODE=batch_infer \
-CHECKPOINT=/data/vjuicefs_ai_camera_3drg_ql/public_data/11188633/focus/models/train/sana_artifact_repair/native_edit_tiny16_lora/checkpoint-5000 \
+DTYPE=fp32 \
+CHECKPOINT=/data/vjuicefs_ai_camera_3drg_ql/public_data/11188633/focus/models/train/sana_artifact_repair/native_edit_v2_tiny16_lora/checkpoint-5000 \
 ZERO_SRC=1 MAX_SAMPLES=20 \
 bash examples/research_projects/artifact_repair/run_sana_artifact_repair_native_edit_lora.sh
 
-# zero ref
+# zero ref condition only
 CUDA_VISIBLE_DEVICES=1 MODE=batch_infer \
-CHECKPOINT=/data/vjuicefs_ai_camera_3drg_ql/public_data/11188633/focus/models/train/sana_artifact_repair/native_edit_tiny16_lora/checkpoint-5000 \
+DTYPE=fp32 \
+CHECKPOINT=/data/vjuicefs_ai_camera_3drg_ql/public_data/11188633/focus/models/train/sana_artifact_repair/native_edit_v2_tiny16_lora/checkpoint-5000 \
 ZERO_REF=1 MAX_SAMPLES=20 \
 bash examples/research_projects/artifact_repair/run_sana_artifact_repair_native_edit_lora.sh
 
-# swap src/ref
+# swap src/ref condition roles, while keeping original src init latent
 CUDA_VISIBLE_DEVICES=1 MODE=batch_infer \
-CHECKPOINT=/data/vjuicefs_ai_camera_3drg_ql/public_data/11188633/focus/models/train/sana_artifact_repair/native_edit_tiny16_lora/checkpoint-5000 \
+DTYPE=fp32 \
+CHECKPOINT=/data/vjuicefs_ai_camera_3drg_ql/public_data/11188633/focus/models/train/sana_artifact_repair/native_edit_v2_tiny16_lora/checkpoint-5000 \
 SWAP_SRC_REF=1 MAX_SAMPLES=20 \
 bash examples/research_projects/artifact_repair/run_sana_artifact_repair_native_edit_lora.sh
 ```

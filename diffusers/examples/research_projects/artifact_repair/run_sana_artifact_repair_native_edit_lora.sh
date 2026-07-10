@@ -13,7 +13,7 @@ OUTPUT_DIR=${OUTPUT_DIR:-/data/vjuicefs_ai_camera_3drg_ql/public_data/11188633/f
 CHECKPOINT=${CHECKPOINT:-${OUTPUT_DIR}}
 
 NUM_PROCESSES=${NUM_PROCESSES:-1}
-MIXED_PRECISION=${MIXED_PRECISION:-bf16}
+MIXED_PRECISION=${MIXED_PRECISION:-no}
 MAIN_PROCESS_PORT=${MAIN_PROCESS_PORT:-29501}
 LOCAL_FILES_ONLY=${LOCAL_FILES_ONLY:-1}
 CACHE_DIR=${CACHE_DIR:-}
@@ -37,12 +37,18 @@ GRADIENT_CHECKPOINTING=${GRADIENT_CHECKPOINTING:-0}
 LORA_RANK=${LORA_RANK:-8}
 LORA_ALPHA=${LORA_ALPHA:-8}
 LORA_TARGET_MODULES=${LORA_TARGET_MODULES:-to_q,to_k,to_v,to_out.0,proj,linear,fc1,fc2}
+LORA_SCOPE=${LORA_SCOPE:-wide}
+NATIVE_EDIT_IMPL=${NATIVE_EDIT_IMPL:-cross_attention_v2}
+EDIT_CONDITION_SCALE=${EDIT_CONDITION_SCALE:-1.0}
 EDIT_ROLE_EMBEDDING=${EDIT_ROLE_EMBEDDING:-1}
+USE_EDIT_TOKEN_NORM=${USE_EDIT_TOKEN_NORM:-1}
+DEBUG_NAN=${DEBUG_NAN:-0}
 
 SRC_IMAGE=${SRC_IMAGE:-}
 REF_IMAGE=${REF_IMAGE:-}
 PROMPT=${PROMPT:-}
 OUTPUT_PATH=${OUTPUT_PATH:-${OUTPUT_DIR}/native_edit_single.png}
+DTYPE=${DTYPE:-auto}
 STEPS=${STEPS:-20}
 GUIDANCE_SCALE=${GUIDANCE_SCALE:-1.0}
 SEED=${SEED:-0}
@@ -75,6 +81,14 @@ fi
 
 train_extra_args=()
 if [[ "${GRADIENT_CHECKPOINTING}" == "1" ]]; then train_extra_args+=(--gradient_checkpointing); fi
+if [[ "${DEBUG_NAN}" == "1" ]]; then train_extra_args+=(--debug_nan); fi
+
+token_norm_args=()
+if [[ "${USE_EDIT_TOKEN_NORM}" == "1" ]]; then
+  token_norm_args+=(--use_edit_token_norm)
+else
+  token_norm_args+=(--no_edit_token_norm)
+fi
 
 ablation_args=()
 if [[ "${ZERO_SRC}" == "1" ]]; then ablation_args+=(--zero_src); fi
@@ -89,7 +103,14 @@ echo "[NATIVE_EDIT] DATASET_METADATA_PATH=${DATASET_METADATA_PATH}"
 echo "[NATIVE_EDIT] TEST_METADATA_PATH=${TEST_METADATA_PATH}"
 echo "[NATIVE_EDIT] OUTPUT_DIR=${OUTPUT_DIR}"
 echo "[NATIVE_EDIT] CHECKPOINT=${CHECKPOINT}"
+echo "[NATIVE_EDIT] MIXED_PRECISION=${MIXED_PRECISION}"
+echo "[NATIVE_EDIT] DTYPE=${DTYPE}"
 echo "[NATIVE_EDIT] LORA_RANK=${LORA_RANK}"
+echo "[NATIVE_EDIT] LORA_SCOPE=${LORA_SCOPE}"
+echo "[NATIVE_EDIT] NATIVE_EDIT_IMPL=${NATIVE_EDIT_IMPL}"
+echo "[NATIVE_EDIT] EDIT_CONDITION_SCALE=${EDIT_CONDITION_SCALE}"
+echo "[NATIVE_EDIT] USE_EDIT_TOKEN_NORM=${USE_EDIT_TOKEN_NORM}"
+echo "[NATIVE_EDIT] DEBUG_NAN=${DEBUG_NAN}"
 echo "[NATIVE_EDIT] MAX_PIXELS=${MAX_PIXELS}"
 echo "[NATIVE_EDIT] INIT_MODE=${INIT_MODE}"
 echo "[NATIVE_EDIT] STRENGTH=${STRENGTH}"
@@ -119,9 +140,13 @@ run_train() {
     --lora_rank "${LORA_RANK}" \
     --lora_alpha "${LORA_ALPHA}" \
     --lora_target_modules "${LORA_TARGET_MODULES}" \
+    --lora_scope "${LORA_SCOPE}" \
+    --native_edit_impl "${NATIVE_EDIT_IMPL}" \
+    --edit_condition_scale "${EDIT_CONDITION_SCALE}" \
     "${size_args[@]}" \
     "${sample_args[@]}" \
     "${role_args[@]}" \
+    "${token_norm_args[@]}" \
     "${train_extra_args[@]}" \
     "${pretrained_args[@]}"
 }
@@ -144,6 +169,7 @@ run_infer() {
     --seed "${SEED}" \
     --init_mode "${INIT_MODE}" \
     --strength "${STRENGTH}" \
+    --dtype "${DTYPE}" \
     "${size_args[@]}" \
     "${prompt_args[@]}" \
     "${pretrained_args[@]}"
@@ -162,6 +188,7 @@ run_batch() {
     --seed "${SEED}" \
     --init_mode "${INIT_MODE}" \
     --strength "${STRENGTH}" \
+    --dtype "${DTYPE}" \
     "${size_args[@]}" \
     "${sample_args[@]}" \
     "${ablation_args[@]}" \

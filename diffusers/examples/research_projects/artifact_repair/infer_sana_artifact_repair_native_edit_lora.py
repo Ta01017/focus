@@ -1,6 +1,7 @@
 #!/usr/bin/env python
 
 import argparse
+import json
 import sys
 from pathlib import Path
 
@@ -24,7 +25,7 @@ from artifact_repair_utils import (  # noqa: E402
     pretrained_kwargs,
     restore_output_size,
 )
-from sana_native_edit_utils import NativeEditSanaTransformer, load_native_edit_assets  # noqa: E402
+from sana_native_edit_utils import SanaNativeEditCrossAttentionWrapper, load_native_edit_assets  # noqa: E402
 
 
 def parse_args():
@@ -41,12 +42,23 @@ def parse_args():
     parser.add_argument("--seed", type=int, default=0)
     parser.add_argument("--init_mode", choices=("noise", "src"), default="src")
     parser.add_argument("--strength", type=float, default=0.15)
+    parser.add_argument("--dtype", choices=("fp32", "bf16", "fp16", "auto"), default="auto")
     parser.add_argument("--max_pixels", type=int, default=1048576)
     parser.add_argument("--size_divisor", type=int, default=32)
     parser.add_argument("--downscale_if_exceeds_max_pixels", action="store_true")
     parser.add_argument("--restore_to_original_size", action=argparse.BooleanOptionalAction, default=True)
     add_pretrained_args(parser)
     return parser.parse_args()
+
+
+def select_dtype(value):
+    if value == "fp32":
+        return torch.float32
+    if value == "bf16":
+        return torch.bfloat16
+    if value == "fp16":
+        return torch.float16
+    return torch.bfloat16 if torch.cuda.is_bf16_supported() else torch.float16
 
 
 @torch.no_grad()
@@ -64,22 +76,25 @@ def decode_latents_to_pil(pipe, latents):
 def load_pipeline(args, dtype):
     checkpoint = Path(args.checkpoint)
     config_model = None
-    edit_role_embedding = True
+    raw_config = {}
     config_path = checkpoint / "native_edit_config.json"
     if not config_path.exists() and (checkpoint.parent / "native_edit_config.json").exists():
         config_path = checkpoint.parent / "native_edit_config.json"
     if config_path.exists():
-        import json
-
         raw_config = json.loads(config_path.read_text(encoding="utf-8"))
         config_model = raw_config.get("model")
-        edit_role_embedding = bool(raw_config.get("edit_role_embedding", True))
     model_id = args.model or config_model or "Efficient-Large-Model/Sana_600M_1024px_diffusers"
     print(f"[NATIVE_EDIT] checkpoint = {checkpoint}", flush=True)
     print(f"[NATIVE_EDIT] model = {model_id}", flush=True)
     pipe = SanaPipeline.from_pretrained(model_id, torch_dtype=dtype, **pretrained_kwargs(args)).to("cuda")
     pipe.vae.to(dtype=torch.float32)
-    native_transformer = NativeEditSanaTransformer(pipe.transformer, use_role_embedding=edit_role_embedding).to("cuda", dtype=dtype)
+    native_transformer = SanaNativeEditCrossAttentionWrapper(
+        pipe.transformer,
+        num_edit_images=int(raw_config.get("num_edit_images", 2)),
+        use_edit_role_embedding=bool(raw_config.get("use_edit_role_embedding", True)),
+        edit_condition_scale=float(raw_config.get("edit_condition_scale", 1.0)),
+        use_edit_token_norm=bool(raw_config.get("use_edit_token_norm", True)),
+    ).to("cuda", dtype=dtype)
     config, lora_path = load_native_edit_assets(checkpoint, native_transformer)
     pipe.load_lora_weights(lora_path)
     pipe.transformer = native_transformer
@@ -87,7 +102,22 @@ def load_pipeline(args, dtype):
 
 
 @torch.no_grad()
-def generate(pipe, native_transformer, prompt, negative_prompt, src_image, ref_image, height, width, steps, guidance_scale, init_mode, strength, generator):
+def generate(
+    pipe,
+    native_transformer,
+    prompt,
+    negative_prompt,
+    src_image,
+    ref_image,
+    height,
+    width,
+    steps,
+    guidance_scale,
+    init_mode,
+    strength,
+    generator,
+    init_image=None,
+):
     device = torch.device("cuda")
     do_cfg = guidance_scale > 1.0
     prompt_embeds, prompt_mask, neg_embeds, neg_mask = pipe.encode_prompt(
@@ -98,6 +128,7 @@ def generate(pipe, native_transformer, prompt, negative_prompt, src_image, ref_i
         prompt_mask = torch.cat([neg_mask, prompt_mask], dim=0)
     src_latents = encode_image_latents(pipe, src_image, height, width, device)
     ref_latents = encode_image_latents(pipe, ref_image, height, width, device)
+    init_latents = encode_image_latents(pipe, init_image, height, width, device) if init_image is not None else src_latents
     pipe.scheduler.set_timesteps(steps, device=device)
     timesteps = pipe.scheduler.timesteps
     if init_mode == "src":
@@ -107,12 +138,12 @@ def generate(pipe, native_transformer, prompt, negative_prompt, src_image, ref_i
         if hasattr(pipe.scheduler, "set_begin_index"):
             pipe.scheduler.set_begin_index(t_start * pipe.scheduler.order)
         sigma = pipe.scheduler.sigmas[t_start].to(device=device, dtype=torch.float32).reshape(1, 1, 1, 1)
-        noise = torch.randn(src_latents.shape, generator=generator, device=device, dtype=src_latents.dtype)
-        latents = (1 - sigma.to(src_latents)) * src_latents + sigma.to(src_latents) * noise
+        noise = torch.randn(init_latents.shape, generator=generator, device=device, dtype=init_latents.dtype)
+        latents = (1 - sigma.to(init_latents)) * init_latents + sigma.to(init_latents) * noise
     else:
         t_start = 0
         sliced = timesteps
-        latents = torch.randn(src_latents.shape, generator=generator, device=device, dtype=src_latents.dtype)
+        latents = torch.randn(init_latents.shape, generator=generator, device=device, dtype=init_latents.dtype)
     for t in sliced:
         latent_input = torch.cat([latents] * 2) if do_cfg else latents
         timestep = t.expand(latent_input.shape[0]) * pipe.transformer.config.timestep_scale
@@ -122,15 +153,13 @@ def generate(pipe, native_transformer, prompt, negative_prompt, src_image, ref_i
             encoder_attention_mask=prompt_mask,
             timestep=timestep,
             edit_hidden_states=[src_latents.to(pipe.transformer.dtype), ref_latents.to(pipe.transformer.dtype)],
-            edit_role_ids=[1, 2],
-            enable_native_edit_tokens=True,
             return_dict=False,
         )[0].float()
         if do_cfg:
             uncond, text = noise_pred.chunk(2)
             noise_pred = uncond + guidance_scale * (text - uncond)
         latents = pipe.scheduler.step(noise_pred, t, latents, return_dict=False)[0]
-    print(f"[NATIVE_EDIT] token lengths: {native_transformer.last_token_stats}", flush=True)
+    print(f"[NATIVE_EDIT_V2] token lengths: {native_transformer.last_token_stats}", flush=True)
     return decode_latents_to_pil(pipe, latents)
 
 
@@ -138,7 +167,7 @@ def main():
     args = parse_args()
     if not torch.cuda.is_available():
         raise RuntimeError("CUDA is required.")
-    dtype = torch.bfloat16 if torch.cuda.is_bf16_supported() else torch.float16
+    dtype = select_dtype(args.dtype)
     pipe, native_transformer, _ = load_pipeline(args, dtype)
     src = load_rgb(args.src_image)
     ref = load_rgb(args.ref_image)
