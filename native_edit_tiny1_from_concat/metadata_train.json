@@ -1,0 +1,14 @@
+[
+  {
+    "image": "images/000_gt.png",
+    "edit_image": [
+      "images/000_src.png",
+      "images/000_ref.png"
+    ],
+    "src": "images/000_src.png",
+    "ref": "images/000_ref.png",
+    "prompt": "Image 1 is the source image with artifacts. Image 2 is the appearance reference. Repair image 1 using image 2 as reference while preserving the structure and viewpoint of image 1.",
+    "obj_name": "concat_tiny1",
+    "test_uid": 0
+  }
+]

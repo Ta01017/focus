@@ -82,6 +82,12 @@ class NativeEditSanaTransformer(nn.Module):
         target_tokens = transformer.patch_embed(hidden_states)
         if target_token_length is None:
             target_token_length = target_tokens.shape[1]
+        expected_target_len = post_patch_height * post_patch_width
+        if target_token_length != expected_target_len:
+            raise ValueError(
+                f"target_token_length={target_token_length} must equal target latent grid "
+                f"{post_patch_height}x{post_patch_width}={expected_target_len}."
+            )
         tokens = [target_tokens]
         role_ids = edit_role_ids or list(range(1, len(edit_hidden_states) + 1))
         edit_lengths = []
@@ -100,6 +106,14 @@ class NativeEditSanaTransformer(nn.Module):
         if self.role_embed is not None:
             tokens[0] = tokens[0] + self.role_embed[0].to(tokens[0])
         hidden_tokens = torch.cat(tokens, dim=1)
+        total_token_length = hidden_tokens.shape[1]
+        if total_token_length % post_patch_height != 0:
+            raise ValueError(
+                f"Concatenated native-edit token length {total_token_length} is not divisible by "
+                f"target post_patch_height={post_patch_height}. Cannot build a valid transformer block grid."
+            )
+        block_post_patch_height = post_patch_height
+        block_post_patch_width = total_token_length // post_patch_height
 
         if guidance is not None:
             timestep, embedded_timestep = transformer.time_embed(timestep, guidance=guidance, hidden_dtype=hidden_tokens.dtype)
@@ -119,8 +133,8 @@ class NativeEditSanaTransformer(nn.Module):
                     encoder_hidden_states,
                     encoder_attention_mask,
                     timestep,
-                    post_patch_height,
-                    post_patch_width,
+                    block_post_patch_height,
+                    block_post_patch_width,
                 )
         else:
             for block in transformer.transformer_blocks:
@@ -130,8 +144,8 @@ class NativeEditSanaTransformer(nn.Module):
                     encoder_hidden_states,
                     encoder_attention_mask,
                     timestep,
-                    post_patch_height,
-                    post_patch_width,
+                    block_post_patch_height,
+                    block_post_patch_width,
                 )
 
         hidden_tokens = hidden_tokens[:, :target_token_length]
@@ -150,7 +164,11 @@ class NativeEditSanaTransformer(nn.Module):
         self.last_token_stats = {
             "target_token_length": int(target_token_length),
             "edit_token_lengths": [int(x) for x in edit_lengths],
-            "total_token_length": int(target_token_length + sum(edit_lengths)),
+            "total_token_length": int(total_token_length),
+            "block_post_patch_height": int(block_post_patch_height),
+            "block_post_patch_width": int(block_post_patch_width),
+            "target_post_patch_height": int(post_patch_height),
+            "target_post_patch_width": int(post_patch_width),
         }
         if not return_dict:
             return (output,)
