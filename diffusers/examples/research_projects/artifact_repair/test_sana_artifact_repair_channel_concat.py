@@ -1,3 +1,11 @@
+"""
+Fast isolated unit tests using a minimal stand-in Transformer.
+
+These tests validate the generic PatchEmbed expansion helpers, but they do not
+replace tests against the real diffusers SanaTransformer2DModel architecture.
+See test_sana_artifact_repair_channel_concat_real_sana.py.
+"""
+
 import copy
 import tempfile
 from pathlib import Path

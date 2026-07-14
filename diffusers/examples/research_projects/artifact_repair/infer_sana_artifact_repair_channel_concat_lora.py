@@ -6,7 +6,7 @@ from pathlib import Path
 
 import torch
 
-from diffusers import SanaPipeline
+from diffusers import SanaPipeline, SanaTransformer2DModel
 
 SCRIPT_DIR = Path(__file__).resolve().parent
 if str(SCRIPT_DIR) not in sys.path:
@@ -26,9 +26,12 @@ from sana_artifact_repair_channel_concat import (  # noqa: E402
     decode_vae_latents,
     encode_vae_latents,
     expand_sana_patch_embedding_for_channel_concat,
+    get_sana_output_channels,
+    get_sana_patch_embedding,
     load_route2_config,
     load_route2_patch_embedding,
     patch_embedding_weight_stats,
+    route2_full_transformer_path,
     route2_lora_path,
     tensor_stats,
 )
@@ -79,24 +82,73 @@ def decode_latents_to_pil(pipe, latents):
     return pipe.image_processor.postprocess(image, output_type="pil")[0]
 
 
+def _validate_loaded_transformer(transformer, config):
+    expected_original_c = int(config["original_latent_channels"])
+    expected_expanded_c = int(config["expanded_input_channels"])
+    expected_output_c = int(config["output_channels"])
+    actual_in_channels = int(transformer.config.in_channels)
+    actual_out_channels = get_sana_output_channels(transformer)
+    _, proj = get_sana_patch_embedding(transformer)
+    if actual_in_channels != expected_expanded_c:
+        raise ValueError(f"Route 2 transformer config.in_channels mismatch: expected {expected_expanded_c}, actual {actual_in_channels}")
+    if actual_out_channels != expected_output_c:
+        raise ValueError(f"Route 2 transformer output channels mismatch: expected {expected_output_c}, actual {actual_out_channels}")
+    if int(proj.in_channels) != expected_expanded_c:
+        raise ValueError(f"Route 2 patch projection in_channels mismatch: expected {expected_expanded_c}, actual {proj.in_channels}")
+    if int(proj.out_channels) <= 0:
+        raise ValueError("Route 2 patch projection has invalid out_channels.")
+    return expected_original_c
+
+
 def load_pipeline(args, dtype):
     checkpoint = Path(args.checkpoint)
     config = load_route2_config(checkpoint)
+    train_mode = config.get("train_mode")
     model_id = args.model or config["base_model"]
     print(f"[ROUTE2] checkpoint={checkpoint}", flush=True)
     print(f"[ROUTE2] base_model={model_id}", flush=True)
-    pipe = SanaPipeline.from_pretrained(model_id, torch_dtype=dtype, **pretrained_kwargs(args)).to("cuda")
+    print(f"[ROUTE2] train_mode={train_mode}", flush=True)
+    patch_path = None
+    lora_path = None
+    if train_mode == "full_transformer":
+        full_transformer_dir = route2_full_transformer_path(checkpoint)
+        if full_transformer_dir is None:
+            raise FileNotFoundError(
+                "Route 2 checkpoint was trained with full_transformer, but the complete transformer directory is missing. "
+                "Using only i2i_patch_embedding would silently discard trained transformer weights."
+            )
+        transformer = SanaTransformer2DModel.from_pretrained(
+            full_transformer_dir,
+            torch_dtype=dtype,
+            local_files_only=args.local_files_only,
+            cache_dir=args.cache_dir,
+            revision=args.revision,
+        )
+        pipe = SanaPipeline.from_pretrained(model_id, transformer=transformer, torch_dtype=dtype, **pretrained_kwargs(args)).to("cuda")
+        original_latent_channels = _validate_loaded_transformer(pipe.transformer, config)
+        print("[ROUTE2] full transformer loaded=true", flush=True)
+        print(f"[ROUTE2] full transformer path={full_transformer_dir}", flush=True)
+        print("[ROUTE2] patch embedding loaded from full transformer=true", flush=True)
+        print("[ROUTE2] LoRA loaded=false", flush=True)
+    elif train_mode in ("patch_lora", "patch_only"):
+        pipe = SanaPipeline.from_pretrained(model_id, torch_dtype=dtype, **pretrained_kwargs(args)).to("cuda")
+        original_latent_channels = expand_sana_patch_embedding_for_channel_concat(pipe.transformer)
+        patch_path = load_route2_patch_embedding(checkpoint, pipe.transformer)
+        _validate_loaded_transformer(pipe.transformer, config)
+        if train_mode == "patch_lora":
+            lora_path = route2_lora_path(checkpoint)
+            if lora_path is None:
+                raise FileNotFoundError("Route 2 checkpoint train_mode=patch_lora but transformer_lora is missing.")
+            pipe.load_lora_weights(lora_path)
+        print("[ROUTE2] full transformer loaded=false", flush=True)
+        print(f"[ROUTE2] patch embedding loaded=true path={patch_path}", flush=True)
+        print(f"[ROUTE2] LoRA loaded={lora_path is not None}", flush=True)
+    else:
+        raise ValueError(f"Unsupported Route 2 train_mode in checkpoint: {train_mode!r}")
     pipe.vae.to(dtype=torch.float32)
-    original_latent_channels = expand_sana_patch_embedding_for_channel_concat(pipe.transformer)
-    patch_path = load_route2_patch_embedding(checkpoint, pipe.transformer)
-    lora_path = route2_lora_path(checkpoint)
-    if lora_path is not None:
-        pipe.load_lora_weights(lora_path)
     pipe.transformer.eval()
     print(f"[ROUTE2] original_latent_channels={original_latent_channels}", flush=True)
-    print(f"[ROUTE2] expanded_input_channels={2 * original_latent_channels}", flush=True)
-    print(f"[ROUTE2] patch embedding loaded=true path={patch_path}", flush=True)
-    print(f"[ROUTE2] LoRA loaded={lora_path is not None}", flush=True)
+    print(f"[ROUTE2] expanded_input_channels={config['expanded_input_channels']}", flush=True)
     print("[ROUTE2] inference init=pure_noise", flush=True)
     print("[ROUTE2] condition=clean src latent channel concat", flush=True)
     return pipe, config, original_latent_channels
