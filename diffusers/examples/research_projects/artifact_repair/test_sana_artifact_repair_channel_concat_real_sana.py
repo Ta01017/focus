@@ -225,3 +225,21 @@ def test_checkpoint_mode_directory_structure(tmp_path):
 
 def test_concat_order_real_sana():
     assert CONCAT_ORDER == ["current_latent", "src_latent"]
+
+
+def test_real_sana_patch_lora_reenables_patch_embedding_after_peft_adapter():
+    torch.manual_seed(6)
+    model = make_tiny_real_sana()
+    model.requires_grad_(False)
+    c = expand_sana_patch_embedding_for_channel_concat(model)
+    add_lora_to_transformer(model, 2, 2, "to_q,to_k,to_v", 0.0, "attn_qkv")
+    patch_embed, patch_proj = get_sana_patch_embedding(model)
+    for parameter in patch_embed.parameters():
+        parameter.requires_grad_(True)
+    assert all(parameter.requires_grad for parameter in patch_embed.parameters())
+
+    inputs = make_inputs()
+    out = forward_real_sana(model, torch.cat([inputs["z_t"], inputs["z_src"]], dim=1), inputs)
+    out.square().mean().backward()
+    assert patch_proj.weight.grad is not None
+    assert patch_proj.weight.grad[:, c : 2 * c].abs().sum().item() > 0

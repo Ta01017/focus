@@ -140,14 +140,24 @@ def patch_embedding_weight_stats(transformer, original_latent_channels):
     condition_weight = weight[:, original_latent_channels : 2 * original_latent_channels]
     target_norm = target_weight.detach().float().norm().clamp_min(1e-12)
     condition_norm = condition_weight.detach().float().norm()
-    condition_grad = condition_weight.grad if condition_weight.requires_grad else None
+    full_weight_grad = proj.weight.grad
+    if full_weight_grad is None:
+        condition_gradient_norm = 0.0
+    else:
+        condition_gradient_norm = float(
+            full_weight_grad[:, original_latent_channels : 2 * original_latent_channels]
+            .detach()
+            .float()
+            .norm()
+            .cpu()
+        )
     return {
         "target_weight_abs_mean": float(target_weight.detach().float().abs().mean().cpu()),
         "condition_weight_abs_mean": float(condition_weight.detach().float().abs().mean().cpu()),
         "target_weight_norm": float(target_norm.cpu()),
         "condition_weight_norm": float(condition_norm.cpu()),
         "condition_target_norm_ratio": float((condition_norm / target_norm).cpu()),
-        "condition_gradient_norm": None if proj.weight.grad is None else float(proj.weight.grad[:, original_latent_channels : 2 * original_latent_channels].detach().float().norm().cpu()),
+        "condition_gradient_norm": condition_gradient_norm,
     }
 
 

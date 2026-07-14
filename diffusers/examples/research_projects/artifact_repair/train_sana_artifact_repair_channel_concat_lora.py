@@ -134,19 +134,27 @@ def main():
     pipe.transformer.requires_grad_(False).eval()
 
     original_latent_channels = expand_sana_patch_embedding_for_channel_concat(pipe.transformer)
-    patch_embed, _ = get_sana_patch_embedding(pipe.transformer)
-    for parameter in patch_embed.parameters():
-        parameter.requires_grad_(args.train_mode in ("patch_lora", "patch_only", "full_transformer"))
-
     matched_lora = []
-    if args.train_mode == "full_transformer":
-        pipe.transformer.requires_grad_(True)
-    elif args.train_mode == "patch_lora":
+    if args.train_mode == "patch_lora":
         matched_lora = add_lora_to_transformer(
-            pipe.transformer, args.lora_rank, args.lora_alpha, args.lora_target_modules, args.lora_dropout, args.lora_scope
+            pipe.transformer,
+            args.lora_rank,
+            args.lora_alpha,
+            args.lora_target_modules,
+            args.lora_dropout,
+            args.lora_scope,
         )
+    elif args.train_mode == "full_transformer":
+        pipe.transformer.requires_grad_(True)
     elif args.train_mode == "patch_only":
         pass
+    else:
+        raise ValueError(f"Unsupported train mode: {args.train_mode}")
+
+    patch_embed, patch_proj = get_sana_patch_embedding(pipe.transformer)
+    if args.train_mode in ("patch_lora", "patch_only", "full_transformer"):
+        for parameter in patch_embed.parameters():
+            parameter.requires_grad_(True)
 
     if args.gradient_checkpointing and hasattr(pipe.transformer, "enable_gradient_checkpointing"):
         pipe.transformer.enable_gradient_checkpointing()
@@ -154,18 +162,42 @@ def main():
     pipe.vae.to(accelerator.device, dtype=torch.float32)
     pipe.transformer.to(accelerator.device, dtype=dtype)
 
-    patch_params = [p for p in patch_embed.parameters() if p.requires_grad]
-    lora_params = [p for n, p in pipe.transformer.named_parameters() if p.requires_grad and "lora" in n.lower()]
+    patch_embed, patch_proj = get_sana_patch_embedding(pipe.transformer)
+    patch_params = [parameter for parameter in patch_embed.parameters() if parameter.requires_grad]
+    lora_named_params = [
+        (name, parameter)
+        for name, parameter in pipe.transformer.named_parameters()
+        if parameter.requires_grad and "lora_" in name
+    ]
+    lora_params = [parameter for _, parameter in lora_named_params]
     if args.train_mode == "full_transformer":
         patch_param_ids = {id(p) for p in patch_params}
         other_params = [p for p in pipe.transformer.parameters() if p.requires_grad and id(p) not in patch_param_ids]
-        optimizer_groups = [{"params": patch_params, "lr": args.patch_learning_rate}, {"params": other_params, "lr": args.learning_rate}]
+        optimizer_groups = [
+            {"params": patch_params, "lr": args.patch_learning_rate, "name": "patch_embedding"},
+            {"params": other_params, "lr": args.learning_rate, "name": "full_transformer"},
+        ]
     elif args.train_mode == "patch_lora":
+        if not patch_params:
+            raise RuntimeError(
+                "patch_lora requires a trainable expanded patch embedding, but patch_params is empty. "
+                "PEFT may have frozen it after add_adapter()."
+            )
         if not lora_params:
-            raise ValueError("train_mode=patch_lora matched no trainable LoRA parameters.")
-        optimizer_groups = [{"params": patch_params, "lr": args.patch_learning_rate}, {"params": lora_params, "lr": args.learning_rate}]
+            raise RuntimeError("patch_lora requires trainable LoRA parameters, but no LoRA parameter was found.")
+        if not all(parameter.requires_grad for parameter in patch_embed.parameters()):
+            raise RuntimeError("Expanded patch embedding is unexpectedly frozen in patch_lora mode.")
+        patch_param_ids = {id(parameter) for parameter in patch_params}
+        lora_param_ids = {id(parameter) for parameter in lora_params}
+        overlap = patch_param_ids & lora_param_ids
+        if overlap:
+            raise RuntimeError(f"Patch and LoRA optimizer groups overlap: {len(overlap)} parameters")
+        optimizer_groups = [
+            {"params": patch_params, "lr": args.patch_learning_rate, "name": "patch_embedding"},
+            {"params": lora_params, "lr": args.learning_rate, "name": "transformer_lora"},
+        ]
     else:
-        optimizer_groups = [{"params": patch_params, "lr": args.patch_learning_rate}]
+        optimizer_groups = [{"params": patch_params, "lr": args.patch_learning_rate, "name": "patch_embedding"}]
     trainable_params = [p for group in optimizer_groups for p in group["params"]]
     if not trainable_params:
         raise ValueError("No trainable parameters for Route 2.")
@@ -236,9 +268,20 @@ def main():
                     raise RuntimeError("[ROUTE2] Non-finite loss.")
                 accelerator.backward(loss)
                 unwrapped = accelerator.unwrap_model(pipe.transformer)
-                current_patch_embed, _ = get_sana_patch_embedding(unwrapped)
+                current_patch_embed, current_patch_proj = get_sana_patch_embedding(unwrapped)
+                if global_step == 0 and args.train_mode == "patch_lora":
+                    patch_weight_grad = current_patch_proj.weight.grad
+                    if patch_weight_grad is None:
+                        raise RuntimeError("Expanded patch embedding has no gradient on the first backward pass.")
+                    condition_grad = patch_weight_grad[:, original_latent_channels : 2 * original_latent_channels]
+                    if not torch.isfinite(condition_grad).all():
+                        raise FloatingPointError("Non-finite condition-channel patch gradient.")
+                    if condition_grad.abs().sum().item() == 0:
+                        raise RuntimeError(
+                            "Condition-channel patch gradient is exactly zero. The src condition path is not learning."
+                        )
                 current_patch_params = [p for p in current_patch_embed.parameters() if p.requires_grad]
-                current_lora_params = [p for n, p in unwrapped.named_parameters() if p.requires_grad and "lora" in n.lower()]
+                current_lora_params = [p for n, p in unwrapped.named_parameters() if p.requires_grad and "lora_" in n]
                 patch_grad = grad_norm(current_patch_params)
                 lora_grad = grad_norm(current_lora_params)
                 accelerator.clip_grad_norm_(trainable_params, 1.0)
@@ -249,7 +292,7 @@ def main():
                 global_step += 1
                 if accelerator.is_main_process and (global_step <= 5 or global_step % args.log_steps == 0):
                     stats = patch_embedding_weight_stats(accelerator.unwrap_model(pipe.transformer), original_latent_channels)
-                    stats["condition_gradient_norm"] = patch_grad
+                    stats["patch_embedding_gradient_norm"] = patch_grad
                     print(
                         f"step={global_step} loss={loss.detach().item():.6f} "
                         f"sigma_mean={sigmas.mean().item():.6f} sigma_min={sigmas.min().item():.6f} sigma_max={sigmas.max().item():.6f}",
