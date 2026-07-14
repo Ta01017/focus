@@ -74,23 +74,6 @@ def encode_vae_latents(vae, pixel_values, scaling_factor=None, sample=True, gene
     return latents * scaling_factor
 
 
-def decode_vae_latents(vae, latents):
-    scaling_factor = getattr(vae.config, "scaling_factor", 1.0)
-    return vae.decode((latents / scaling_factor).to(vae.dtype), return_dict=False)[0]
-
-
-def tensor_stats(x):
-    x = x.detach().float().cpu()
-    return {
-        "shape": list(x.shape),
-        "min": float(x.min()),
-        "max": float(x.max()),
-        "mean": float(x.mean()),
-        "std": float(x.std()),
-        "dtype": str(x.dtype),
-    }
-
-
 def create_condition_adapter(adapter_type, latent_channels, hidden_channels):
     if adapter_type == "ab":
         return DualImageConditionAdapter(latent_channels, hidden_channels)
