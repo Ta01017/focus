@@ -200,3 +200,139 @@ PYTHONPATH="$PWD/src:$PWD/examples/research_projects/artifact_repair" \
 pytest -q -s \
   examples/research_projects/artifact_repair/test_sana_artifact_repair_channel_concat_pretrained.py
 ```
+
+
+## Focus Fusion – Wan-style Latent Concat and Image Cross-Attention
+
+新增 Focus WAN 路线，代码派生自现有 artifact-repair Wan-style latent-concat and image cross-attention route：
+
+- `sana_artifact_repair_wan_crossattn.py`
+- `train_sana_artifact_repair_wan_crossattn.py`
+- `infer_sana_artifact_repair_wan_crossattn.py`
+- `batch_infer_sana_artifact_repair_wan_crossattn.py`
+
+新路线文件：
+
+```text
+sana_focus_wan_crossattn.py
+train_sana_focus_wan_crossattn.py
+infer_sana_focus_wan_crossattn.py
+batch_infer_sana_focus_wan_crossattn.py
+run_sana_focus_wan_crossattn.sh
+```
+
+### 架构
+
+单图：
+
+```text
+condition_mode=single
+GT -> z_gt
+A/edit_image[0] -> z_a
+model input = cat([z_t, z_a], channel)  # 2C patch input
+A -> CLIP Vision -> image_projector -> per-block independent image K/V + image_gate
+```
+
+双图：
+
+```text
+condition_mode=dual
+GT -> z_gt
+A/edit_image[0] -> z_a
+B/edit_image[1] -> z_b
+model input = cat([z_t, z_a, z_b], channel)  # 3C patch input
+A -> CLIP Vision -> image_projector_a -> image K/V A + gate A
+B -> CLIP Vision -> image_projector_b -> image K/V B + gate B
+```
+
+文本 cross-attention 保持不变；image cross-attention 使用共享 query、独立 image K/V。focus map 当前只保留 metadata 兼容，不参与模型计算。
+
+### 1. 单图 tiny16 fp32 20-step smoke
+
+```bash
+cd /mnt/d/work/vivo/focus/focus/diffusers
+CONDITION_MODE=single \
+MODE=train \
+MAX_SAMPLES=16 \
+MAX_TRAIN_STEPS=20 \
+MIXED_PRECISION=no \
+OUTPUT_DIR=/data/vjuicefs_ai_camera_3drg_ql/public_data/11193880/focus/models/train/sana_focus_wan_crossattn/single_tiny16_smoke \
+bash examples/research_projects/artifact_repair/run_sana_focus_wan_crossattn.sh
+```
+
+### 2. 双图 tiny16 fp32 20-step smoke
+
+```bash
+cd /mnt/d/work/vivo/focus/focus/diffusers
+CONDITION_MODE=dual \
+MODE=train \
+MAX_SAMPLES=16 \
+MAX_TRAIN_STEPS=20 \
+MIXED_PRECISION=no \
+OUTPUT_DIR=/data/vjuicefs_ai_camera_3drg_ql/public_data/11193880/focus/models/train/sana_focus_wan_crossattn/dual_tiny16_smoke \
+bash examples/research_projects/artifact_repair/run_sana_focus_wan_crossattn.sh
+```
+
+### 3. 单图正式训练
+
+```bash
+cd /mnt/d/work/vivo/focus/focus/diffusers
+CONDITION_MODE=single \
+MODE=train \
+MAX_TRAIN_STEPS=10000 \
+MAX_SAMPLES= \
+OUTPUT_DIR=/data/vjuicefs_ai_camera_3drg_ql/public_data/11193880/focus/models/train/sana_focus_wan_crossattn/single_full \
+bash examples/research_projects/artifact_repair/run_sana_focus_wan_crossattn.sh
+```
+
+### 4. 双图正式训练
+
+```bash
+cd /mnt/d/work/vivo/focus/focus/diffusers
+CONDITION_MODE=dual \
+MODE=train \
+MAX_TRAIN_STEPS=10000 \
+MAX_SAMPLES= \
+OUTPUT_DIR=/data/vjuicefs_ai_camera_3drg_ql/public_data/11193880/focus/models/train/sana_focus_wan_crossattn/dual_full \
+bash examples/research_projects/artifact_repair/run_sana_focus_wan_crossattn.sh
+```
+
+### 5. Batch inference
+
+单图：
+
+```bash
+cd /mnt/d/work/vivo/focus/focus/diffusers
+CONDITION_MODE=single \
+MODE=batch_infer \
+CHECKPOINT=/data/vjuicefs_ai_camera_3drg_ql/public_data/11193880/focus/models/train/sana_focus_wan_crossattn/single_full/checkpoint-10000 \
+OUTPUT_DIR=/data/vjuicefs_ai_camera_3drg_ql/public_data/11193880/focus/outputs/focus_wan_single \
+MAX_SAMPLES=16 \
+INIT_MODE=a \
+STRENGTH=0.3 \
+bash examples/research_projects/artifact_repair/run_sana_focus_wan_crossattn.sh
+```
+
+双图：
+
+```bash
+cd /mnt/d/work/vivo/focus/focus/diffusers
+CONDITION_MODE=dual \
+MODE=batch_infer \
+CHECKPOINT=/data/vjuicefs_ai_camera_3drg_ql/public_data/11193880/focus/models/train/sana_focus_wan_crossattn/dual_full/checkpoint-10000 \
+OUTPUT_DIR=/data/vjuicefs_ai_camera_3drg_ql/public_data/11193880/focus/outputs/focus_wan_dual \
+MAX_SAMPLES=16 \
+INIT_MODE=a \
+STRENGTH=0.3 \
+bash examples/research_projects/artifact_repair/run_sana_focus_wan_crossattn.sh
+```
+
+Checkpoint 格式：
+
+```text
+checkpoint-N/
+  focus_wan_config.json
+  focus_wan_condition.safetensors
+  transformer_lora/pytorch_lora_weights.safetensors
+  trainer_state.json
+```
