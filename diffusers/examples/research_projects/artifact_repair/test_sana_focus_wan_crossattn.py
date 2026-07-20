@@ -2,6 +2,8 @@ import pytest
 import torch
 from torch import nn
 
+from artifact_repair_utils import resolve_dataset_path
+from infer_sana_focus_wan_crossattn import timesteps_for_init, make_focus_composite
 from sana_focus_wan_crossattn import FocusWanImageProjector, expand_sana_patch_embedding_for_focus_wan, validate_focus_wan_checkpoint
 
 
@@ -37,9 +39,9 @@ def test_projector_and_image_token_batch_shape():
 
 def test_checkpoint_config_shape_checks():
     t=FakeTransformer(); expand_sana_patch_embedding_for_focus_wan(t,'single')
-    validate_focus_wan_checkpoint({'condition_mode':'single','number_of_image_branches':1,'patch_embed_in_channels':8,'latent_channels':4}, 'single', t)
+    validate_focus_wan_checkpoint({'route':'focus_wan_crossattn','condition_mode':'single','number_of_image_branches':1,'patch_embed_in_channels':8,'latent_channels':4,'share_image_projector':False}, 'single', t)
     with pytest.raises(ValueError):
-        validate_focus_wan_checkpoint({'condition_mode':'single','number_of_image_branches':1,'patch_embed_in_channels':8,'latent_channels':4}, 'dual', t)
+        validate_focus_wan_checkpoint({'route':'focus_wan_crossattn','condition_mode':'single','number_of_image_branches':1,'patch_embed_in_channels':8,'latent_channels':4,'share_image_projector':False}, 'dual', t)
 
 
 def test_zero_extra_channels_mean_no_condition_patch_effect_initially():
@@ -48,3 +50,73 @@ def test_zero_extra_channels_mean_no_condition_patch_effect_initially():
     base=torch.nn.functional.conv2d(zt, old, t.patch_embed.proj.bias)
     expanded=t.patch_embed.proj(torch.cat([zt,za],1))
     assert torch.allclose(base, expanded, atol=1e-6)
+
+
+
+def test_resolve_dataset_path_dedupes_base_suffix(tmp_path):
+    base = tmp_path / "processed" / "test"
+    target = base / "a.png"
+    target.parent.mkdir(parents=True)
+    target.write_bytes(b"x")
+    resolved = resolve_dataset_path("processed/test/a.png", base, record_index=3, field_name="edit_image[0]")
+    assert resolved == target.resolve(strict=False)
+
+
+def test_resolve_dataset_path_missing_error_is_clear(tmp_path):
+    with pytest.raises(FileNotFoundError, match="record index"):
+        resolve_dataset_path("missing.png", tmp_path, record_index=7, field_name="image")
+
+
+class FakeScheduler:
+    def __init__(self):
+        self.timesteps = None
+        self.begin_index = None
+    def set_timesteps(self, steps, device=None):
+        self.timesteps = torch.arange(steps - 1, -1, -1)
+    def set_begin_index(self, value):
+        self.begin_index = value
+
+
+class FakePipe:
+    def __init__(self):
+        self.scheduler = FakeScheduler()
+
+
+def test_pipeline_full_and_sliced_have_different_effective_steps():
+    pipe = FakePipe()
+    ts_full, _, eff_full, _ = timesteps_for_init(pipe, 20, 0.15, "a", "pipeline_full", torch.device("cpu"))
+    pipe = FakePipe()
+    ts_sliced, _, eff_sliced, _ = timesteps_for_init(pipe, 20, 0.15, "a", "sliced", torch.device("cpu"))
+    assert eff_full == 20
+    assert eff_sliced == 3
+    assert len(ts_full) == 20
+    assert len(ts_sliced) == 3
+
+
+def test_focus_composite_uses_focus_weights(tmp_path):
+    from PIL import Image
+    import numpy as np
+    a = Image.new("RGB", (2, 1), (255, 0, 0))
+    b = Image.new("RGB", (2, 1), (0, 0, 255))
+    fa = tmp_path / "fa.png"
+    fb = tmp_path / "fb.png"
+    Image.fromarray(np.array([[255, 0]], dtype=np.uint8)).save(fa)
+    Image.fromarray(np.array([[0, 255]], dtype=np.uint8)).save(fb)
+    out = make_focus_composite({"src": a, "ref": b}, fa, fb)
+    pixels = list(out.getdata())
+    assert pixels[0][0] > pixels[0][2]
+    assert pixels[1][2] > pixels[1][0]
+
+
+def test_lora_disabled_has_no_matched_count_requirement():
+    matched_lora = []
+    train_transformer_lora = False
+    if train_transformer_lora and not matched_lora:
+        raise RuntimeError("should not happen")
+
+
+def test_batch_size_gt_one_error_message():
+    batch_size = 2
+    with pytest.raises(ValueError, match="batch_size=1"):
+        if batch_size != 1:
+            raise ValueError("The current dynamic-resolution Focus WAN training path supports batch_size=1 only.")

@@ -36,21 +36,66 @@ def write_json(path, data):
 
 
 def resolve_path(base, path):
-    path = Path(path)
-    if path.is_absolute():
-        return path
-    base = Path(base)
-    direct = base / path
-    if direct.exists():
-        return direct
-    base_parts = base.parts
-    path_parts = path.parts
-    for overlap in range(min(len(base_parts), len(path_parts)), 0, -1):
-        if base_parts[-overlap:] == path_parts[:overlap]:
-            deduped = base.joinpath(*path_parts[overlap:])
-            if deduped.exists():
-                return deduped
-    return direct
+    return resolve_dataset_path(path, base, must_exist=False)
+
+
+
+
+def resolve_dataset_path(
+    value,
+    dataset_base_path=None,
+    *,
+    record_index=None,
+    field_name=None,
+    must_exist=True,
+):
+    if value is None or str(value) == "":
+        raise ValueError(
+            f"Empty dataset path: record index={record_index}, field={field_name}, "
+            f"dataset_base_path={dataset_base_path!r}."
+        )
+    raw = Path(value)
+    base = Path(dataset_base_path) if dataset_base_path not in (None, "") else Path(".")
+    attempted = []
+
+    def remember(candidate):
+        candidate = Path(candidate)
+        if candidate not in attempted:
+            attempted.append(candidate)
+        return candidate
+
+    if raw.is_absolute():
+        final = remember(raw)
+    else:
+        remember(raw)
+        direct = remember(base / raw)
+        final = direct
+        base_parts = base.parts
+        raw_parts = raw.parts
+        for overlap in range(min(len(base_parts), len(raw_parts)), 0, -1):
+            if base_parts[-overlap:] == raw_parts[:overlap]:
+                final = remember(base.joinpath(*raw_parts[overlap:]))
+                break
+        for candidate in attempted:
+            if candidate.exists():
+                final = candidate
+                break
+    try:
+        resolved = final.resolve(strict=False)
+    except OSError:
+        resolved = final.absolute()
+    if must_exist and not resolved.exists():
+        attempted_text = "\n".join(f"  - {path}" for path in attempted)
+        raise FileNotFoundError(
+            "Dataset path does not exist.\n"
+            f"record index: {record_index}\n"
+            f"field name: {field_name}\n"
+            f"raw metadata value: {value}\n"
+            f"dataset_base_path: {dataset_base_path}\n"
+            f"attempted paths:\n{attempted_text}\n"
+            f"final resolved path: {resolved}"
+        )
+    return resolved
 
 
 def load_rgb(path):

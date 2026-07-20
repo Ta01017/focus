@@ -86,7 +86,7 @@ def load_pipeline(args, dtype):
     image_args=argparse.Namespace(image_encoder_model=cfg['image_encoder'], image_encoder_subfolder=None, image_encoder_revision=None, image_encoder_local_files_only=args.local_files_only)
     image_encoder, image_processor=load_image_encoder_and_processor(image_args, dtype=dtype, device='cuda')
     model=build_focus_wan_model(pipe.transformer, args.condition_mode, int(cfg['image_encoder_hidden_size']), cfg.get('image_gate_init',1e-3), cfg.get('share_image_projector',False)).to('cuda', dtype=dtype).eval()
-    validate_focus_wan_checkpoint(cfg, args.condition_mode, model.transformer)
+    validate_focus_wan_checkpoint(cfg, args.condition_mode, model.transformer, cfg.get('share_image_projector', False))
     load_focus_wan_condition_state_dict(model, ckpt_dir/'focus_wan_condition.safetensors')
     lora_dir=ckpt_dir/'transformer_lora'
     if lora_dir.exists(): pipe.load_lora_weights(lora_dir)
@@ -94,22 +94,66 @@ def load_pipeline(args, dtype):
     return pipe, image_encoder, image_processor, cfg, ckpt_dir
 
 
-def timesteps_for_init(pipe, steps, strength, init_mode, device):
+def timesteps_for_init(pipe, steps, strength, init_mode, schedule_mode, device):
     pipe.scheduler.set_timesteps(steps, device=device)
-    ts=pipe.scheduler.timesteps
-    if init_mode=='noise': return ts,0,steps
-    eff=max(1, min(steps, int(steps*strength)))
-    start=max(steps-eff,0)
-    if hasattr(pipe.scheduler,'set_begin_index'): pipe.scheduler.set_begin_index(start)
-    return ts[start:], start, eff
+    full_timesteps = pipe.scheduler.timesteps
+    if init_mode == 'noise':
+        return full_timesteps, 0, steps, full_timesteps[0]
+    init_timestep = max(1, min(steps, int(steps * strength)))
+    t_start = max(steps - init_timestep, 0)
+    start_timestep = full_timesteps[t_start]
+    if schedule_mode == 'pipeline_full':
+        if hasattr(pipe.scheduler, 'set_begin_index'):
+            pipe.scheduler.set_begin_index(0)
+        return full_timesteps, t_start, steps, start_timestep
+    if schedule_mode == 'sliced':
+        if hasattr(pipe.scheduler, 'set_begin_index'):
+            pipe.scheduler.set_begin_index(t_start)
+        return full_timesteps[t_start:], t_start, len(full_timesteps[t_start:]), start_timestep
+    raise ValueError(f'Unsupported img2img_schedule_mode={schedule_mode!r}')
+
+
+def load_focus_mask(path, size):
+    from PIL import Image
+    import numpy as np
+    mask = Image.open(path).convert('L').resize(size, Image.Resampling.BILINEAR)
+    return torch.from_numpy(np.asarray(mask, dtype='float32') / 255.0).unsqueeze(0)
+
+
+def make_focus_composite(prepared, focus_a_path, focus_b_path, debug_dir=None):
+    import numpy as np
+    from PIL import Image
+    size = prepared['src'].size
+    focus_a = load_focus_mask(focus_a_path, size)
+    focus_b = load_focus_mask(focus_b_path, size)
+    eps = 1e-6
+    denom = focus_a + focus_b
+    weight_a = (focus_a / (denom + eps)).clamp(0, 1)
+    invalid = denom < eps
+    a = torch.from_numpy(np.asarray(prepared['src'], dtype='float32') / 255.0).permute(2, 0, 1)
+    b = torch.from_numpy(np.asarray(prepared['ref'], dtype='float32') / 255.0).permute(2, 0, 1)
+    composite = weight_a * a + (1.0 - weight_a) * b
+    composite = torch.where(invalid.expand_as(composite), a, composite).clamp(0, 1)
+    if debug_dir:
+        d = Path(debug_dir); d.mkdir(parents=True, exist_ok=True)
+        Image.fromarray((focus_a.squeeze(0).numpy() * 255).astype('uint8')).save(d / 'focus_a.png')
+        Image.fromarray((focus_b.squeeze(0).numpy() * 255).astype('uint8')).save(d / 'focus_b.png')
+        Image.fromarray((weight_a.squeeze(0).numpy() * 255).astype('uint8')).save(d / 'focus_weight_a.png')
+    image = Image.fromarray((composite.permute(1, 2, 0).numpy() * 255).astype('uint8'))
+    if debug_dir:
+        image.save(Path(debug_dir) / 'focus_composite.png')
+    return image
 
 
 @torch.no_grad()
 def generate(pipe, image_encoder, image_processor, cfg, args, a_img, b_img=None):
     if args.condition_mode=='dual' and b_img is None: raise ValueError('dual mode requires --image_b')
     init_mode=args.init_mode or 'a'
-    if init_mode=='focus_composite':
-        if not args.focus_a or not args.focus_b: raise ValueError('focus_composite requires focus maps; first Focus WAN version does not use focus maps by default.')
+    if init_mode == 'focus_composite':
+        if args.condition_mode != 'dual':
+            raise ValueError('focus_composite is only valid for condition_mode=dual.')
+        if not args.focus_a or not args.focus_b:
+            raise ValueError('focus_composite requires --focus_a and --focus_b.')
     device=torch.device('cuda')
     gen=torch.Generator(device=device).manual_seed(args.seed)
     prompt=args.prompt or focus_prompt(args.condition_mode)
@@ -122,13 +166,18 @@ def generate(pipe, image_encoder, image_processor, cfg, args, a_img, b_img=None)
     z_b=encode_latent(pipe, prepared['ref'], h, w, device) if args.condition_mode=='dual' else None
     tok_a=encode_image_tokens(image_encoder, image_processor, [prepared['src']], device, pipe.transformer.dtype)
     tok_b=encode_image_tokens(image_encoder, image_processor, [prepared['ref']], device, pipe.transformer.dtype) if args.condition_mode=='dual' else None
-    ts,start,eff=timesteps_for_init(pipe,args.steps,args.strength,init_mode,device)
+    ts,start,eff,start_timestep=timesteps_for_init(pipe,args.steps,args.strength,init_mode,args.img2img_schedule_mode,device)
     noise=torch.randn(z_a.shape,generator=gen,device=device,dtype=z_a.dtype)
-    if init_mode=='a':
-        latent_timestep=pipe.scheduler.timesteps[start].expand(z_a.shape[0])
-        latents=pipe.scheduler.add_noise(original_samples=z_a, noise=noise, timesteps=latent_timestep)
+    if init_mode == 'a':
+        latent_timestep = pipe.scheduler.timesteps[start].expand(z_a.shape[0])
+        latents = pipe.scheduler.add_noise(original_samples=z_a, noise=noise, timesteps=latent_timestep)
+    elif init_mode == 'focus_composite':
+        composite = make_focus_composite(prepared, args.focus_a, args.focus_b, args.debug_dir)
+        z_composite = encode_latent(pipe, composite, h, w, device)
+        latent_timestep = pipe.scheduler.timesteps[start].expand(z_composite.shape[0])
+        latents = pipe.scheduler.add_noise(original_samples=z_composite, noise=noise, timesteps=latent_timestep)
     else:
-        latents=noise
+        latents = noise
     scales=[cfg.get('image_cross_attention_scale_a',1.0) if args.image_cross_attention_scale_a is None else args.image_cross_attention_scale_a]
     if args.condition_mode=='dual': scales.append(cfg.get('image_cross_attention_scale_b',1.0) if args.image_cross_attention_scale_b is None else args.image_cross_attention_scale_b)
     for t in ts:
@@ -136,18 +185,24 @@ def generate(pipe, image_encoder, image_processor, cfg, args, a_img, b_img=None)
         a_in=torch.cat([z_a,z_a],0) if do_cfg else z_a
         if args.condition_mode=='dual':
             b_in=torch.cat([z_b,z_b],0) if do_cfg else z_b
+            assert latent_in.shape == a_in.shape == b_in.shape
             model_input=torch.cat([latent_in,a_in,b_in],1)
+            assert model_input.shape[1] == 3 * cfg['latent_channels']
             image_inputs=[torch.cat([tok_a,tok_a],0) if do_cfg else tok_a, torch.cat([tok_b,tok_b],0) if do_cfg else tok_b]
+            assert len(image_inputs) == 2
         else:
+            assert latent_in.shape == a_in.shape
             model_input=torch.cat([latent_in,a_in],1)
+            assert model_input.shape[1] == 2 * cfg['latent_channels']
             image_inputs=[torch.cat([tok_a,tok_a],0) if do_cfg else tok_a]
+            assert len(image_inputs) == 1
         tin=t.expand(latent_in.shape[0])*pipe.transformer.config.timestep_scale
         pred=pipe.transformer(hidden_states=model_input.to(pipe.transformer.dtype), encoder_hidden_states=pe.to(pipe.transformer.dtype), encoder_attention_mask=pm, encoder_hidden_states_images=image_inputs, image_cross_attention_scales=scales, timestep=tin, return_dict=False)[0].float()
         if do_cfg:
             u,c=pred.chunk(2); pred=u+args.guidance_scale*(c-u)
         latents=pipe.scheduler.step(pred,t,latents,return_dict=False)[0]
     out=decode_pil(pipe,latents)
-    stats={'condition_mode':args.condition_mode,'checkpoint':str(args.checkpoint),'steps':args.steps,'strength':args.strength,'init_mode':init_mode,'schedule mode':args.img2img_schedule_mode,'latent shapes':{'a':list(z_a.shape),'b':list(z_b.shape) if z_b is not None else None,'final':list(latents.shape)},'vision token shapes':{'a':list(tok_a.shape),'b':list(tok_b.shape) if tok_b is not None else None},'image gate values':pipe.transformer.image_cross_attention_adapter.gate_values()[0],'output finite status':bool(torch.isfinite(latents).all().cpu()),'effective_steps':eff,'status':'success'}
+    stats={'condition_mode':args.condition_mode,'checkpoint':str(args.checkpoint),'steps':args.steps,'strength':args.strength,'init_mode':init_mode,'img2img_schedule_mode':args.img2img_schedule_mode,'schedule mode':args.img2img_schedule_mode,'requested_steps':args.steps,'effective_steps':eff,'start_timestep':float(start_timestep.detach().float().cpu()) if hasattr(start_timestep, 'detach') else float(start_timestep),'latent shapes':{'a':list(z_a.shape),'b':list(z_b.shape) if z_b is not None else None,'final':list(latents.shape)},'vision token shapes':{'a':list(tok_a.shape),'b':list(tok_b.shape) if tok_b is not None else None},'image gate values':pipe.transformer.image_cross_attention_adapter.gate_values()[0],'output finite status':bool(torch.isfinite(latents).all().cpu()),'status':'success'}
     return out, stats, prepared, size_info
 
 

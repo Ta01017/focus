@@ -10,7 +10,7 @@ from PIL import Image
 SCRIPT_DIR=Path(__file__).resolve().parent
 if str(SCRIPT_DIR) not in sys.path: sys.path.insert(0,str(SCRIPT_DIR))
 
-from artifact_repair_utils import add_pretrained_args, load_metadata, load_rgb, resolve_path, write_json
+from artifact_repair_utils import add_pretrained_args, load_metadata, load_rgb, resolve_dataset_path, write_json
 from infer_sana_focus_wan_crossattn import generate, load_pipeline, select_dtype
 
 
@@ -70,11 +70,13 @@ def main():
             edits=sample.get(args.edit_key)
             need=1 if args.condition_mode=='single' else 2
             if not isinstance(edits,list) or len(edits)<need: raise ValueError(f'edit_image length insufficient for {args.condition_mode}')
-            a_path=resolve_path(args.dataset_base_path, edits[0])
-            b_path=resolve_path(args.dataset_base_path, edits[1]) if len(edits)>1 else None
-            gt_path=resolve_path(args.dataset_base_path, sample[args.target_key])
+            a_path=resolve_dataset_path(edits[0], args.dataset_base_path, record_index=index, field_name=f"{args.edit_key}[0]")
+            b_path=resolve_dataset_path(edits[1], args.dataset_base_path, record_index=index, field_name=f"{args.edit_key}[1]") if len(edits)>1 else None
+            gt_path=resolve_dataset_path(sample[args.target_key], args.dataset_base_path, record_index=index, field_name=args.target_key)
+            focus_a_path=resolve_dataset_path(edits[2], args.dataset_base_path, record_index=index, field_name=f"{args.edit_key}[2]") if len(edits)>2 else None
+            focus_b_path=resolve_dataset_path(edits[3], args.dataset_base_path, record_index=index, field_name=f"{args.edit_key}[3]") if len(edits)>3 else None
             a=load_rgb(a_path); b=load_rgb(b_path) if b_path else None
-            run_args=argparse.Namespace(**vars(args)); run_args.image_a=str(a_path); run_args.image_b=str(b_path) if b_path else None; run_args.output=str(output); run_args.seed=args.seed+index; run_args.debug_dir=str(outdir/f'{index:06d}_debug') if args.save_debug else None
+            run_args=argparse.Namespace(**vars(args)); run_args.image_a=str(a_path); run_args.image_b=str(b_path) if b_path else None; run_args.focus_a=str(focus_a_path) if focus_a_path else None; run_args.focus_b=str(focus_b_path) if focus_b_path else None; run_args.output=str(output); run_args.seed=args.seed+index; run_args.debug_dir=str(outdir/f'{index:06d}_debug') if args.save_debug else None
             if run_args.prompt is None and sample.get(args.prompt_key): run_args.prompt=sample[args.prompt_key]
             image, stats, prepared, size_info=generate(pipe,enc,proc,cfg,run_args,a,b)
             from artifact_repair_utils import restore_output_size
@@ -87,7 +89,7 @@ def main():
                     bvis=b.resize(image.size, Image.Resampling.LANCZOS); comp=outdir/f'{index:06d}_comparison.png'; concat_images([avis,bvis,gt,image]).save(comp)
                 else:
                     comp=outdir/f'{index:06d}_comparison.png'; concat_images([avis,gt,image]).save(comp)
-            rows.append({'index':index,'src/A path':str(a_path),'B path':str(b_path) if b_path else None,'GT path':str(gt_path),'output path':str(output),'comparison path':str(comp) if comp else None,'status':'success','error':None,'condition_mode':args.condition_mode,'checkpoint':str(args.checkpoint)})
+            rows.append({'index':index,'src/A path':str(a_path),'B path':str(b_path) if b_path else None,'GT path':str(gt_path),'focus_a path':str(focus_a_path) if focus_a_path else None,'focus_b path':str(focus_b_path) if focus_b_path else None,'output path':str(output),'comparison path':str(comp) if comp else None,'status':'success','error':None,'condition_mode':args.condition_mode,'checkpoint':str(args.checkpoint)})
             print(f'[FOCUS_WAN][BATCH] ok index={index} output={output}',flush=True)
         except Exception as e:
             failed.append(index); rows.append({'index':index,'output path':str(output),'status':'error','error':repr(e),'condition_mode':args.condition_mode,'checkpoint':str(args.checkpoint)})

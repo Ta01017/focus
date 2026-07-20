@@ -336,3 +336,118 @@ checkpoint-N/
   transformer_lora/pytorch_lora_weights.safetensors
   trainer_state.json
 ```
+
+
+### Focus WAN 工程修复说明
+
+当前 Focus Fusion – Wan-style Latent Concat and Image Cross-Attention 路线保持原始结构不变：
+
+```text
+single: cat([z_t, z_a], channel), patch input = 2C, image branches = 1
+dual:   cat([z_t, z_a, z_b], channel), patch input = 3C, image branches = 2
+```
+
+本路线来自已有 artifact repair WAN route。GT 只作为训练 target，推理阶段不输入 GT。
+
+#### 动态尺寸 batch 限制
+
+当前动态尺寸训练只支持：
+
+```text
+BATCH_SIZE=1
+NUM_WORKERS=0
+```
+
+如果需要更大的有效 batch，请使用：
+
+```text
+GRADIENT_ACCUMULATION_STEPS > 1
+```
+
+脚本会在 `BATCH_SIZE>1` 时明确报错，不会静默丢弃 `samples[1:]`。
+
+#### LoRA 开关
+
+支持：
+
+```bash
+TRAIN_TRANSFORMER_LORA=1
+TRAIN_TRANSFORMER_LORA=0
+```
+
+关闭 LoRA 时仍会训练：
+
+```text
+expanded patch embedding condition channels
+image projector(s)
+image K/V projections
+image gate(s)
+```
+
+#### init_from_checkpoint 与 resume_from_checkpoint
+
+```text
+INIT_FROM_CHECKPOINT：只加载模型权重，optimizer/global_step 从 0 开始。
+RESUME_FROM_CHECKPOINT：加载模型权重和 accelerator_state，恢复 optimizer/scaler/global_step。
+```
+
+如果 checkpoint 没有 `accelerator_state/`，不能用于 resume，应改用 `INIT_FROM_CHECKPOINT`。
+
+#### sliced 与 pipeline_full
+
+`IMG2IMG_SCHEDULE_MODE=sliced` 会按 strength 截取后半段 timesteps：
+
+```text
+steps=20, strength=0.15 -> effective_steps=3
+```
+
+`IMG2IMG_SCHEDULE_MODE=pipeline_full` 会执行完整 timestep 序列：
+
+```text
+effective_steps = steps
+```
+
+两者不再是同一个空参数。
+
+#### focus_composite
+
+`INIT_MODE=focus_composite` 已实现，仅允许 `CONDITION_MODE=dual`，并且必须提供 `focus_a/focus_b`。
+它只影响初始 latent：
+
+```text
+focus composite RGB -> VAE -> z_init
+```
+
+A/B latent concat 条件和 A/B image cross-attention 条件保持不变。
+
+#### checkpoint 自动查找
+
+`run_sana_focus_wan_crossattn.sh` 中，如果没有显式设置 `CHECKPOINT`，推理会在 `OUTPUT_DIR` 下自动查找最新：
+
+```text
+checkpoint-*
+```
+
+不会再默认把 `OUTPUT_DIR` 当作 checkpoint。
+
+#### 继续训练示例
+
+```bash
+cd /mnt/d/work/vivo/focus/focus/diffusers
+CONDITION_MODE=single \
+MODE=train \
+RESUME_FROM_CHECKPOINT=/path/to/checkpoint-1000 \
+MAX_TRAIN_STEPS=2000 \
+bash examples/research_projects/artifact_repair/run_sana_focus_wan_crossattn.sh
+```
+
+#### 从 checkpoint 初始化重新训练示例
+
+```bash
+cd /mnt/d/work/vivo/focus/focus/diffusers
+CONDITION_MODE=dual \
+MODE=train \
+INIT_FROM_CHECKPOINT=/path/to/checkpoint-1000 \
+OUTPUT_DIR=/path/to/new_run \
+bash examples/research_projects/artifact_repair/run_sana_focus_wan_crossattn.sh
+```

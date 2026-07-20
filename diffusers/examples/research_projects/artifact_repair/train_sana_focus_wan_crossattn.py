@@ -16,7 +16,7 @@ SCRIPT_DIR = Path(__file__).resolve().parent
 if str(SCRIPT_DIR) not in sys.path:
     sys.path.insert(0, str(SCRIPT_DIR))
 
-from artifact_repair_utils import add_pretrained_args, load_metadata, load_rgb, preprocess_triplet, pretrained_kwargs
+from artifact_repair_utils import add_pretrained_args, load_metadata, load_rgb, preprocess_triplet, pretrained_kwargs, resolve_dataset_path
 from sana_artifact_repair_channel_concat import DEFAULT_LORA_TARGET_MODULES, add_lora_to_transformer, get_sana_patch_embedding, tensor_stats
 from sana_focus_wan_crossattn import (
     build_focus_wan_model,
@@ -54,7 +54,7 @@ def parse_args():
     p.add_argument("--start_index", type=int, default=0)
     p.add_argument("--max_samples", type=int, default=None)
     p.add_argument("--batch_size", type=int, default=1)
-    p.add_argument("--num_workers", type=int, default=4)
+    p.add_argument("--num_workers", type=int, default=0)
     p.add_argument("--gradient_accumulation_steps", type=int, default=1)
     p.add_argument("--learning_rate", type=float, default=1e-4)
     p.add_argument("--patch_learning_rate", type=float, default=1e-4)
@@ -76,6 +76,7 @@ def parse_args():
     p.add_argument("--image_cross_attention_scale_a", type=float, default=1.0)
     p.add_argument("--image_cross_attention_scale_b", type=float, default=1.0)
     p.add_argument("--share_image_projector", action=argparse.BooleanOptionalAction, default=False)
+    p.add_argument("--init_from_checkpoint", default=None)
     p.add_argument("--resume_from_checkpoint", default=None)
     p.add_argument("--mixed_precision", choices=("no", "fp16", "bf16"), default="no")
     p.add_argument("--gradient_checkpointing", action="store_true")
@@ -86,15 +87,6 @@ def parse_args():
     p.add_argument("--seed", type=int, default=0)
     add_pretrained_args(p)
     return p.parse_args()
-
-
-def resolve_path_once(base, value, index, label):
-    raw = Path(value)
-    path = raw if raw.is_absolute() else Path(base) / raw
-    print(f"[FOCUS_WAN][PATH] index={index} {label}: raw={value} resolved={path}", flush=True)
-    if not path.exists():
-        raise FileNotFoundError(f"record index={index} {label} missing: raw={value} resolved={path}")
-    return path
 
 
 class FocusWanDataset(Dataset):
@@ -115,9 +107,9 @@ class FocusWanDataset(Dataset):
         need = 1 if self.args.condition_mode == "single" else 2
         if not isinstance(edits, list) or len(edits) < need:
             raise ValueError(f"record index={i} requires {need} edit images for {self.args.condition_mode}.")
-        gt = load_rgb(resolve_path_once(self.args.dataset_base_path, sample[self.args.target_key], i, "GT"))
-        a = load_rgb(resolve_path_once(self.args.dataset_base_path, edits[0], i, "A"))
-        b = load_rgb(resolve_path_once(self.args.dataset_base_path, edits[1], i, "B")) if len(edits) > 1 else a
+        gt = load_rgb(resolve_dataset_path(sample[self.args.target_key], self.args.dataset_base_path, record_index=i, field_name=self.args.target_key))
+        a = load_rgb(resolve_dataset_path(edits[0], self.args.dataset_base_path, record_index=i, field_name=f"{self.args.edit_key}[0]"))
+        b = load_rgb(resolve_dataset_path(edits[1], self.args.dataset_base_path, record_index=i, field_name=f"{self.args.edit_key}[1]")) if len(edits) > 1 else a
         prompt = sample.get(self.args.prompt_key) or self.args.prompt or focus_prompt(self.args.condition_mode)
         return {"gt": gt, "a": a, "b": b, "prompt": prompt, "has_focus": len(edits) > 2}
 
@@ -134,15 +126,42 @@ def grad_norm(ps):
     return total ** 0.5
 
 
-def finite_check(name, tensor, step):
+def assert_finite(name, tensor, step):
     if tensor is not None and not torch.isfinite(tensor).all():
-        raise RuntimeError(f"[FOCUS_WAN] non-finite tensor step={step} name={name} stats={tensor_stats(tensor)}")
+        raise FloatingPointError(
+            f"Non-finite tensor detected: name={name}, step={step}, "
+            f"shape={tuple(tensor.shape)}, dtype={tensor.dtype}"
+        )
+
+
+def read_trainer_state(checkpoint):
+    path = Path(checkpoint) / "trainer_state.json"
+    if not path.exists():
+        raise FileNotFoundError(f"Missing trainer_state.json in resume checkpoint: {checkpoint}")
+    return json.loads(path.read_text(encoding="utf-8"))
 
 
 def main():
     args = parse_args()
     if args.batch_size != 1:
-        raise ValueError("Dynamic Focus WAN training currently requires --batch_size 1.")
+        raise ValueError(
+            "The current dynamic-resolution Focus WAN training path supports batch_size=1 only. "
+            "Use gradient_accumulation_steps for a larger effective batch."
+        )
+    if args.num_workers != 0:
+        print(
+            "[FOCUS_WAN][WARNING] dynamic preprocessing currently requires num_workers=0; "
+            "overriding requested value.",
+            flush=True,
+        )
+        args.num_workers = 0
+    if args.random_crop and args.center_crop:
+        raise ValueError("--random_crop and --center_crop cannot both be enabled.")
+    if args.random_crop or args.center_crop or args.random_horizontal_flip:
+        raise NotImplementedError(
+            "Focus WAN random_crop/center_crop/random_horizontal_flip are not implemented in this dynamic path yet; "
+            "leave them disabled to avoid fake augmentation."
+        )
     if args.pixel_loss_weight != 0 or args.x0_loss_weight != 0:
         raise ValueError("First Focus WAN version requires --pixel_loss_weight=0 and --x0_loss_weight=0.")
     random.seed(args.seed); torch.manual_seed(args.seed)
@@ -159,16 +178,25 @@ def main():
     if args.train_transformer_lora:
         matched_lora = add_lora_to_transformer(pipe.transformer, args.lora_rank, args.lora_alpha, args.lora_target_modules, args.lora_dropout, args.lora_scope)
         if not matched_lora:
-            raise RuntimeError("LoRA matched module count is 0.")
+            raise RuntimeError("train_transformer_lora=True, but no LoRA target modules were matched.")
+    else:
+        print(
+            "[INFO] transformer LoRA training disabled; only Focus WAN condition modules will be trained.",
+            flush=True,
+        )
 
     image_encoder, image_processor = load_image_encoder_and_processor(args, dtype=dtype, device=accelerator.device)
     model = build_focus_wan_model(pipe.transformer, args.condition_mode, int(image_encoder.config.hidden_size), args.image_gate_init, args.share_image_projector)
-    if args.resume_from_checkpoint:
-        cfg, ckpt_dir = load_focus_wan_config(args.resume_from_checkpoint)
-        validate_focus_wan_checkpoint(cfg, args.condition_mode, model.transformer)
+    checkpoint_to_init = args.resume_from_checkpoint or args.init_from_checkpoint
+    if checkpoint_to_init:
+        cfg, ckpt_dir = load_focus_wan_config(checkpoint_to_init)
+        validate_focus_wan_checkpoint(cfg, args.condition_mode, model.transformer, args.share_image_projector)
         load_focus_wan_condition_state_dict(model, ckpt_dir / "focus_wan_condition.safetensors")
         if args.train_transformer_lora and (ckpt_dir / "transformer_lora").exists():
             pipe.load_lora_weights(ckpt_dir / "transformer_lora")
+        if args.init_from_checkpoint and not args.resume_from_checkpoint:
+            print(f"[INFO] initialized model weights from checkpoint {args.init_from_checkpoint}", flush=True)
+            print("[INFO] optimizer and scheduler start from step 0", flush=True)
 
     model.transformer.requires_grad_(False)
     if args.train_transformer_lora:
@@ -197,12 +225,15 @@ def main():
     accelerator.print(f"[FOCUS_WAN] expanded patch trainable parameters={count_params(patch_params):,}", flush=True)
     accelerator.print(f"[FOCUS_WAN] image projector trainable parameters={count_params(model.image_projectors.parameters()):,}", flush=True)
     accelerator.print(f"[FOCUS_WAN] image K/V and gate trainable parameters={count_params(model.image_cross_attention_adapter.parameters()):,}", flush=True)
+    accelerator.print(f"[FOCUS_WAN] transformer LoRA enabled: {bool(args.train_transformer_lora)}", flush=True)
     accelerator.print(f"[FOCUS_WAN] transformer LoRA trainable parameters={count_params(lora_params):,}", flush=True)
+    accelerator.print(f"[FOCUS_WAN] WAN condition trainable parameter count={count_params(patch_params) + count_params(image_params):,}", flush=True)
     accelerator.print(f"[FOCUS_WAN] LoRA matched module count={len(matched_lora)} first={matched_lora[:8]}", flush=True)
     accelerator.print(f"[FOCUS_WAN] A is used; B is {'used' if args.condition_mode == 'dual' else 'ignored'}; focus maps are ignored by the baseline WAN model", flush=True)
 
     dataset = FocusWanDataset(args)
     def collate(samples):
+        assert len(samples) == 1, "Focus WAN dynamic collate supports exactly one sample; set batch_size=1."
         s = samples[0]
         prepared, size_info = preprocess_triplet(s["gt"], s["a"], s["b"], args.max_pixels, args.size_divisor, args.downscale_if_exceeds_max_pixels)
         w, h = size_info["canvas_size"]
@@ -212,6 +243,17 @@ def main():
     outdir = Path(args.output_dir)
     if accelerator.is_main_process: outdir.mkdir(parents=True, exist_ok=True)
     global_step = 0
+    if args.resume_from_checkpoint:
+        state_dir = Path(args.resume_from_checkpoint) / "accelerator_state"
+        if not state_dir.exists():
+            raise FileNotFoundError(
+                f"--resume_from_checkpoint requires complete accelerator state at {state_dir}. "
+                "This checkpoint only supports weight initialization; use --init_from_checkpoint instead."
+            )
+        accelerator.load_state(str(state_dir))
+        trainer_state = read_trainer_state(args.resume_from_checkpoint)
+        global_step = int(trainer_state["global_step"])
+        accelerator.print(f"[FOCUS_WAN] resumed global_step={global_step}", flush=True)
     scheduler_timesteps = scheduler.timesteps.to(accelerator.device); scheduler_sigmas = scheduler.sigmas.to(accelerator.device)
     scales = [args.image_cross_attention_scale_a] if args.condition_mode == "single" else [args.image_cross_attention_scale_a, args.image_cross_attention_scale_b]
     while global_step < args.max_train_steps:
@@ -232,14 +274,29 @@ def main():
                     sigmas = scheduler_sigmas[idx].view(-1,1,1,1).to(z_gt.dtype)
                     z_t = (1.0 - sigmas) * z_gt + sigmas * noise
                     target = noise - z_gt
-                    model_input = torch.cat([z_t, z_a], dim=1) if args.condition_mode == "single" else torch.cat([z_t, z_a, z_b], dim=1)
-                    image_inputs = [tok_a] if args.condition_mode == "single" else [tok_a, tok_b]
+                    if args.condition_mode == "single":
+                        assert z_t.shape == z_a.shape, f"single latent shape mismatch: z_t={z_t.shape}, z_a={z_a.shape}"
+                        model_input = torch.cat([z_t, z_a], dim=1)
+                        assert model_input.shape[1] == 2 * latent_channels
+                        image_inputs = [tok_a]
+                        assert len(image_inputs) == 1
+                    else:
+                        assert z_t.shape == z_a.shape == z_b.shape, f"dual latent shape mismatch: z_t={z_t.shape}, z_a={z_a.shape}, z_b={z_b.shape}"
+                        model_input = torch.cat([z_t, z_a, z_b], dim=1)
+                        assert model_input.shape[1] == 3 * latent_channels
+                        image_inputs = [tok_a, tok_b]
+                        assert len(image_inputs) == 2
                 if args.debug_check_finite:
                     for name, value in (("z_gt", z_gt), ("z_t", z_t), ("tok_a", tok_a), ("tok_b", tok_b)):
-                        finite_check(name, value, global_step)
+                        assert_finite(name, value, global_step)
                 pred = model(hidden_states=model_input.to(dtype), encoder_hidden_states=prompt_embeds, encoder_attention_mask=prompt_mask, encoder_hidden_states_images=image_inputs, image_cross_attention_scales=scales, timestep=timesteps, return_dict=False)[0].float()
                 loss = F.mse_loss(pred, target.float())
-                if args.debug_check_finite: finite_check("prediction", pred, global_step); finite_check("loss", loss, global_step)
+                if args.debug_check_finite:
+                    for idx_projector, stat in enumerate(accelerator.unwrap_model(model).last_debug.get("projected_image_stats", [])):
+                        pass
+                    assert_finite("prediction", pred, global_step)
+                    assert_finite("target", target, global_step)
+                    assert_finite("loss", loss, global_step)
                 accelerator.backward(loss)
                 patch_grad = grad_norm(patch_params); image_grad = grad_norm(image_params); lora_grad = grad_norm(lora_params)
                 optimizer.step(); optimizer.zero_grad(set_to_none=True)
@@ -255,10 +312,36 @@ def main():
             if accelerator.is_main_process and global_step % args.save_steps == 0:
                 ckpt = outdir / f"checkpoint-{global_step}"
                 save_focus_wan_checkpoint(ckpt, accelerator.unwrap_model(model), args, global_step, latent_channels, int(image_encoder.config.hidden_size))
+                accelerator.save_state(str(ckpt / "accelerator_state"))
+                (ckpt / "trainer_state.json").write_text(
+                    json.dumps(
+                        {
+                            "global_step": global_step,
+                            "max_train_steps": args.max_train_steps,
+                            "condition_mode": args.condition_mode,
+                            "train_transformer_lora": bool(args.train_transformer_lora),
+                        },
+                        indent=2,
+                    ),
+                    encoding="utf-8",
+                )
                 accelerator.print(f"[FOCUS_WAN] saved checkpoint={ckpt}", flush=True)
     if accelerator.is_main_process:
         ckpt = outdir / f"checkpoint-{global_step}"
         save_focus_wan_checkpoint(ckpt, accelerator.unwrap_model(model), args, global_step, latent_channels, int(image_encoder.config.hidden_size))
+        accelerator.save_state(str(ckpt / "accelerator_state"))
+        (ckpt / "trainer_state.json").write_text(
+            json.dumps(
+                {
+                    "global_step": global_step,
+                    "max_train_steps": args.max_train_steps,
+                    "condition_mode": args.condition_mode,
+                    "train_transformer_lora": bool(args.train_transformer_lora),
+                },
+                indent=2,
+            ),
+            encoding="utf-8",
+        )
         save_focus_wan_checkpoint(outdir, accelerator.unwrap_model(model), args, global_step, latent_channels, int(image_encoder.config.hidden_size))
         accelerator.print(f"[FOCUS_WAN] done checkpoint={ckpt}", flush=True)
 

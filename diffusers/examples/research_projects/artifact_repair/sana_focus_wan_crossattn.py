@@ -414,9 +414,21 @@ def save_focus_wan_checkpoint(directory, model, args, global_step, latent_channe
         "max_pixels": int(args.max_pixels),
         "size_divisor": int(args.size_divisor),
         "global_step": int(global_step),
+        "train_transformer_lora": bool(getattr(args, "train_transformer_lora", True)),
     }
     (directory / "focus_wan_config.json").write_text(json.dumps(config, indent=2, ensure_ascii=False), encoding="utf-8")
-    (directory / "trainer_state.json").write_text(json.dumps({"global_step": int(global_step)}, indent=2), encoding="utf-8")
+    (directory / "trainer_state.json").write_text(
+        json.dumps(
+            {
+                "global_step": int(global_step),
+                "max_train_steps": int(getattr(args, "max_train_steps", 0)),
+                "condition_mode": args.condition_mode,
+                "train_transformer_lora": bool(getattr(args, "train_transformer_lora", True)),
+            },
+            indent=2,
+        ),
+        encoding="utf-8",
+    )
     return config
 
 
@@ -427,18 +439,36 @@ def load_focus_wan_config(checkpoint):
             config = json.loads(path.read_text(encoding="utf-8"))
             if config.get("route") != ROUTE:
                 raise ValueError(f"Not a Focus WAN checkpoint: {path}")
+            condition_path = path.parent / "focus_wan_condition.safetensors"
+            if not condition_path.exists():
+                raise FileNotFoundError(f"Missing required Focus WAN condition weights: {condition_path}")
             return config, path.parent
-    raise FileNotFoundError(f"focus_wan_config.json not found in {checkpoint} or parent.")
+    raise FileNotFoundError(
+        f"focus_wan_config.json not found in {checkpoint} or parent. "
+        "Pass a checkpoint-N directory containing focus_wan_config.json and focus_wan_condition.safetensors."
+    )
 
 
-def validate_focus_wan_checkpoint(config, condition_mode, transformer):
+def validate_focus_wan_checkpoint(config, condition_mode, transformer, share_image_projector=None):
     expected_branches = num_condition_images(condition_mode)
-    if config.get("condition_mode") != condition_mode:
-        raise ValueError(f"checkpoint condition_mode={config.get('condition_mode')} is incompatible with requested condition_mode={condition_mode}")
+    checkpoint_mode = config.get("condition_mode")
+    if checkpoint_mode != condition_mode:
+        raise ValueError(f"Checkpoint condition_mode mismatch: checkpoint={checkpoint_mode}, requested={condition_mode}")
+    if config.get("route") != ROUTE:
+        raise ValueError(f"Checkpoint route mismatch: checkpoint={config.get('route')}, expected={ROUTE}")
     if int(config.get("number_of_image_branches")) != expected_branches:
         raise ValueError("number_of_image_branches mismatch.")
+    if share_image_projector is not None and bool(config.get("share_image_projector")) != bool(share_image_projector):
+        raise ValueError(
+            f"share_image_projector mismatch: checkpoint={config.get('share_image_projector')}, "
+            f"requested={share_image_projector}"
+        )
     _, proj = get_sana_patch_embedding(transformer)
+    expected_in_channels = int(config.get("latent_channels")) * (1 + expected_branches)
+    if int(config.get("patch_embed_in_channels")) != expected_in_channels:
+        raise ValueError(
+            f"checkpoint config is inconsistent: patch_embed_in_channels={config.get('patch_embed_in_channels')} "
+            f"but latent_channels={config.get('latent_channels')} and branches={expected_branches}"
+        )
     if int(config.get("patch_embed_in_channels")) != int(proj.in_channels):
         raise ValueError(f"patch_embed_in_channels mismatch: ckpt={config.get('patch_embed_in_channels')} model={proj.in_channels}")
-    if int(config.get("latent_channels")) * (1 + expected_branches) != int(proj.in_channels):
-        raise ValueError("latent_channels and patch_embed_in_channels are inconsistent.")
