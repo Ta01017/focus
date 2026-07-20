@@ -20,6 +20,10 @@ BATCH_SIZE=${BATCH_SIZE:-1}
 NUM_WORKERS=${NUM_WORKERS:-0}
 GRADIENT_ACCUMULATION_STEPS=${GRADIENT_ACCUMULATION_STEPS:-1}
 LEARNING_RATE=${LEARNING_RATE:-${LR:-1e-4}}
+LR_SCHEDULER=${LR_SCHEDULER:-constant}
+LR_WARMUP_STEPS=${LR_WARMUP_STEPS:-0}
+LR_NUM_CYCLES=${LR_NUM_CYCLES:-1}
+LR_POWER=${LR_POWER:-1.0}
 MIXED_PRECISION=${MIXED_PRECISION:-no}
 DTYPE=${DTYPE:-fp32}
 TRAIN_TRANSFORMER_LORA=${TRAIN_TRANSFORMER_LORA:-1}
@@ -61,6 +65,10 @@ echo "[FOCUS_WAN_RUN] NUM_WORKERS=${NUM_WORKERS}"
 echo "[FOCUS_WAN_RUN] INIT_FROM_CHECKPOINT=${INIT_FROM_CHECKPOINT}"
 echo "[FOCUS_WAN_RUN] RESUME_FROM_CHECKPOINT=${RESUME_FROM_CHECKPOINT}"
 echo "[FOCUS_WAN_RUN] LEARNING_RATE=${LEARNING_RATE}"
+echo "[FOCUS_WAN_RUN] LR_SCHEDULER=${LR_SCHEDULER}"
+echo "[FOCUS_WAN_RUN] LR_WARMUP_STEPS=${LR_WARMUP_STEPS}"
+echo "[FOCUS_WAN_RUN] GRADIENT_ACCUMULATION_STEPS=${GRADIENT_ACCUMULATION_STEPS}"
+echo "[FOCUS_WAN_RUN] MAX_TRAIN_STEPS=${MAX_TRAIN_STEPS}"
 
 
 find_latest_checkpoint() {
@@ -109,7 +117,8 @@ case "${MODE}" in
       --output_dir "${OUTPUT_DIR}" "${sample_args[@]}" --start_index "${START_INDEX}" \
       --dataset_repeat "${DATASET_REPEAT}" --max_train_steps "${MAX_TRAIN_STEPS}" --save_steps "${SAVE_STEPS}" --log_steps "${LOG_STEPS}" \
       --batch_size "${BATCH_SIZE}" --num_workers "${NUM_WORKERS}" --gradient_accumulation_steps "${GRADIENT_ACCUMULATION_STEPS}" \
-      --learning_rate "${LEARNING_RATE}" --mixed_precision "${MIXED_PRECISION}" \
+      --learning_rate "${LEARNING_RATE}" --lr_scheduler "${LR_SCHEDULER}" --lr_warmup_steps "${LR_WARMUP_STEPS}" \
+      --lr_num_cycles "${LR_NUM_CYCLES}" --lr_power "${LR_POWER}" --mixed_precision "${MIXED_PRECISION}" \
       --lora_scope "${LORA_SCOPE}" --lora_rank "${LORA_RANK}" --lora_alpha "${LORA_ALPHA}" --lora_dropout "${LORA_DROPOUT}" \
       --max_pixels "${MAX_PIXELS}" --size_divisor "${SIZE_DIVISOR}" --image_encoder_model "${IMAGE_ENCODER_MODEL}" \
       "${lora_args[@]}" "${debug_args[@]}" "${train_resume_args[@]}" "${common_size[@]}" "${common_pretrained[@]}"

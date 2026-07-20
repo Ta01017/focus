@@ -384,30 +384,71 @@ image K/V projections
 image gate(s)
 ```
 
-#### init_from_checkpoint 与 resume_from_checkpoint
+#### 训练步数、LR scheduler 与 resume
+
+`MAX_TRAIN_STEPS` 表示真实 optimizer update 数，不是 micro-batch 数。比如：
 
 ```text
-INIT_FROM_CHECKPOINT：只加载模型权重，optimizer/global_step 从 0 开始。
-RESUME_FROM_CHECKPOINT：加载模型权重和 accelerator_state，恢复 optimizer/scaler/global_step。
+GRADIENT_ACCUMULATION_STEPS=4
+MAX_TRAIN_STEPS=3
 ```
 
-如果 checkpoint 没有 `accelerator_state/`，不能用于 resume，应改用 `INIT_FROM_CHECKPOINT`。
+会消费 12 个 micro-batch，只产生 3 次 optimizer update，并保存 `checkpoint-1/2/3` 这种真实 update 编号。`LOG_STEPS`、`SAVE_STEPS`、`trainer_state.json` 的 `global_step` 都按 optimizer update 计数。
+
+训练脚本现在使用 diffusers 的真实 LR scheduler：
+
+```bash
+LR_SCHEDULER=constant          # constant / constant_with_warmup / linear / cosine
+LR_WARMUP_STEPS=0
+LR_NUM_CYCLES=1
+LR_POWER=1.0
+```
+
+`lr_scheduler` 会和 model、optimizer、dataloader 一起交给 `accelerator.prepare()`，并且只在 `accelerator.sync_gradients=True` 的 optimizer update 边界前进一步。
+
+```text
+INIT_FROM_CHECKPOINT：只加载模型权重，optimizer/scheduler/global_step 从 0 开始。
+RESUME_FROM_CHECKPOINT：加载模型权重和 accelerator_state，恢复 optimizer/scheduler/scaler/global_step。
+```
+
+如果 checkpoint 没有 `accelerator_state/`，不能用于 resume，应改用 `INIT_FROM_CHECKPOINT`。`trainer_state.json` 会记录 `global_step`、`lr_scheduler`、`lr_warmup_steps` 和当前 LR。
 
 #### sliced 与 pipeline_full
 
-`IMG2IMG_SCHEDULE_MODE=sliced` 会按 strength 截取后半段 timesteps：
+`IMG2IMG_SCHEDULE_MODE=sliced` 是标准 img2img 语义，用于：
 
 ```text
-steps=20, strength=0.15 -> effective_steps=3
+INIT_MODE=a
+INIT_MODE=focus_composite
 ```
 
-`IMG2IMG_SCHEDULE_MODE=pipeline_full` 会执行完整 timestep 序列：
+它会按 strength 截取后半段 timesteps，并用同一个首个 denoise timestep 给初始 latent 加噪：
 
 ```text
+steps=20, strength=0.15 -> t_start_index=17, effective_steps=3
+initial_noise_timestep == first_denoise_timestep
+```
+
+`IMG2IMG_SCHEDULE_MODE=pipeline_full` 被明确定义为完整纯噪声生成：
+
+```text
+INIT_MODE=noise
 effective_steps = steps
+latents = noise * scheduler.init_noise_sigma
 ```
 
-两者不再是同一个空参数。
+此时 A/B 仍然作为条件输入进入 latent concat 和 image cross-attention，但不再用 A 或 focus composite 构造中间噪声 latent。
+
+如果使用：
+
+```text
+IMG2IMG_SCHEDULE_MODE=pipeline_full INIT_MODE=a
+IMG2IMG_SCHEDULE_MODE=pipeline_full INIT_MODE=focus_composite
+```
+
+脚本会直接报错，避免“中间 sigma 初始化，却从最高噪声 timestep denoise”的不一致。
+
+推理 stats 会记录：`requested_steps`、`effective_steps`、`requested_strength`、`effective_strength`、`t_start_index`、`initial_noise_timestep`、`first_denoise_timestep`、`initial_sigma`、`schedule_consistent`。
 
 #### focus_composite
 

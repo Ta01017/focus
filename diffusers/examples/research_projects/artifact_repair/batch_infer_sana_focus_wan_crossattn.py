@@ -42,6 +42,8 @@ def parse_args():
     p.add_argument('--restore_to_original_size', action=argparse.BooleanOptionalAction, default=True)
     p.add_argument('--dtype', choices=('fp32','bf16','fp16','auto'), default='auto')
     p.add_argument('--seed', type=int, default=0)
+    p.add_argument('--image_cross_attention_scale_a', type=float, default=None)
+    p.add_argument('--image_cross_attention_scale_b', type=float, default=None)
     add_pretrained_args(p)
     return p.parse_args()
 

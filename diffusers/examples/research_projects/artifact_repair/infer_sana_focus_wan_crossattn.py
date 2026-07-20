@@ -94,24 +94,126 @@ def load_pipeline(args, dtype):
     return pipe, image_encoder, image_processor, cfg, ckpt_dir
 
 
-def timesteps_for_init(pipe, steps, strength, init_mode, schedule_mode, device):
+def _as_float(value):
+    if hasattr(value, 'detach'):
+        return float(value.detach().float().cpu())
+    return float(value)
+
+
+def _as_plain_number(value):
+    value = _as_float(value)
+    return int(value) if value.is_integer() else value
+
+
+def sigma_for_timestep(scheduler, timestep, device):
+    if not hasattr(scheduler, 'sigmas'):
+        raise RuntimeError('Scheduler does not expose sigmas; cannot verify img2img noise schedule consistency.')
+    scheduler_timesteps = scheduler.timesteps.to(device)
+    scheduler_sigmas = scheduler.sigmas.to(device)
+    timestep_tensor = timestep.to(device) if hasattr(timestep, 'to') else torch.tensor(timestep, device=device)
+    matches = torch.nonzero(torch.isclose(scheduler_timesteps.float(), timestep_tensor.float()), as_tuple=False).flatten()
+    if matches.numel() == 0:
+        raise RuntimeError(f'Could not find timestep={_as_float(timestep)} in scheduler.timesteps.')
+    return scheduler_sigmas[int(matches[0].item())]
+
+
+def prepare_timesteps_for_init(pipe, steps, strength, init_mode, schedule_mode, device):
+    if steps <= 0:
+        raise ValueError('--steps must be positive.')
     pipe.scheduler.set_timesteps(steps, device=device)
     full_timesteps = pipe.scheduler.timesteps
-    if init_mode == 'noise':
-        return full_timesteps, 0, steps, full_timesteps[0]
-    init_timestep = max(1, min(steps, int(steps * strength)))
-    t_start = max(steps - init_timestep, 0)
-    start_timestep = full_timesteps[t_start]
+    order = int(getattr(pipe.scheduler, 'order', 1))
+
     if schedule_mode == 'pipeline_full':
+        if init_mode != 'noise':
+            raise ValueError(
+                "img2img_schedule_mode='pipeline_full' requires init_mode='noise'. "
+                "Use img2img_schedule_mode='sliced' for A or focus-composite initialization."
+            )
+        if strength != 1.0:
+            print(
+                "[FOCUS_WAN][WARNING] strength is ignored for pipeline_full noise initialization; effective strength is 1.0.",
+                flush=True,
+            )
         if hasattr(pipe.scheduler, 'set_begin_index'):
             pipe.scheduler.set_begin_index(0)
-        return full_timesteps, t_start, steps, start_timestep
-    if schedule_mode == 'sliced':
-        if hasattr(pipe.scheduler, 'set_begin_index'):
-            pipe.scheduler.set_begin_index(t_start)
-        return full_timesteps[t_start:], t_start, len(full_timesteps[t_start:]), start_timestep
-    raise ValueError(f'Unsupported img2img_schedule_mode={schedule_mode!r}')
+        first_timestep = full_timesteps[0]
+        init_sigma = getattr(pipe.scheduler, 'init_noise_sigma', None)
+        if init_sigma is None:
+            init_sigma = sigma_for_timestep(pipe.scheduler, first_timestep, device)
+        return {
+            'timesteps': full_timesteps,
+            't_start_index': 0,
+            'effective_steps': len(full_timesteps),
+            'requested_strength': float(strength),
+            'effective_strength': 1.0,
+            'initial_noise_timestep': first_timestep,
+            'first_denoise_timestep': first_timestep,
+            'initial_sigma': init_sigma,
+            'schedule_consistent': True,
+            'scheduler_begin_index': 0,
+            'scheduler_order': order,
+        }
 
+    if schedule_mode != 'sliced':
+        raise ValueError(f'Unsupported img2img_schedule_mode={schedule_mode!r}')
+
+    if init_mode in ('a', 'focus_composite'):
+        if not (0.0 < strength <= 1.0):
+            raise ValueError("sliced img2img with init_mode='a' or 'focus_composite' requires 0 < strength <= 1.")
+        init_steps = min(max(int(round(steps * strength)), 1), steps)
+        t_start = max(steps - init_steps, 0)
+        timesteps = full_timesteps[t_start:]
+        if len(timesteps) == 0:
+            raise RuntimeError('Sliced timestep schedule is empty.')
+        if hasattr(pipe.scheduler, 'set_begin_index'):
+            pipe.scheduler.set_begin_index(t_start * order)
+        first_timestep = timesteps[0]
+        initial_timestep = first_timestep
+        init_sigma = sigma_for_timestep(pipe.scheduler, first_timestep, device)
+        schedule_consistent = torch.isclose(first_timestep.float(), initial_timestep.float()).all().item()
+        if not schedule_consistent:
+            raise RuntimeError('Initial latent noise timestep does not match the first denoising timestep.')
+        return {
+            'timesteps': timesteps,
+            't_start_index': t_start,
+            'effective_steps': len(timesteps),
+            'requested_strength': float(strength),
+            'effective_strength': float(strength),
+            'initial_noise_timestep': initial_timestep,
+            'first_denoise_timestep': first_timestep,
+            'initial_sigma': init_sigma,
+            'schedule_consistent': bool(schedule_consistent),
+            'scheduler_begin_index': t_start * order,
+            'scheduler_order': order,
+        }
+
+    if init_mode == 'noise':
+        if hasattr(pipe.scheduler, 'set_begin_index'):
+            pipe.scheduler.set_begin_index(0)
+        first_timestep = full_timesteps[0]
+        init_sigma = getattr(pipe.scheduler, 'init_noise_sigma', None)
+        if init_sigma is None:
+            init_sigma = sigma_for_timestep(pipe.scheduler, first_timestep, device)
+        return {
+            'timesteps': full_timesteps,
+            't_start_index': 0,
+            'effective_steps': len(full_timesteps),
+            'requested_strength': float(strength),
+            'effective_strength': 1.0,
+            'initial_noise_timestep': first_timestep,
+            'first_denoise_timestep': first_timestep,
+            'initial_sigma': init_sigma,
+            'schedule_consistent': True,
+            'scheduler_begin_index': 0,
+            'scheduler_order': order,
+        }
+    raise ValueError(f'Unsupported init_mode={init_mode!r}')
+
+
+def timesteps_for_init(pipe, steps, strength, init_mode, schedule_mode, device):
+    plan = prepare_timesteps_for_init(pipe, steps, strength, init_mode, schedule_mode, device)
+    return plan['timesteps'], plan['t_start_index'], plan['effective_steps'], plan['initial_noise_timestep']
 
 def load_focus_mask(path, size):
     from PIL import Image
@@ -166,18 +268,24 @@ def generate(pipe, image_encoder, image_processor, cfg, args, a_img, b_img=None)
     z_b=encode_latent(pipe, prepared['ref'], h, w, device) if args.condition_mode=='dual' else None
     tok_a=encode_image_tokens(image_encoder, image_processor, [prepared['src']], device, pipe.transformer.dtype)
     tok_b=encode_image_tokens(image_encoder, image_processor, [prepared['ref']], device, pipe.transformer.dtype) if args.condition_mode=='dual' else None
-    ts,start,eff,start_timestep=timesteps_for_init(pipe,args.steps,args.strength,init_mode,args.img2img_schedule_mode,device)
+    schedule_plan=prepare_timesteps_for_init(pipe,args.steps,args.strength,init_mode,args.img2img_schedule_mode,device)
+    ts=schedule_plan['timesteps']
     noise=torch.randn(z_a.shape,generator=gen,device=device,dtype=z_a.dtype)
     if init_mode == 'a':
-        latent_timestep = pipe.scheduler.timesteps[start].expand(z_a.shape[0])
+        latent_timestep = schedule_plan['initial_noise_timestep'].expand(z_a.shape[0])
         latents = pipe.scheduler.add_noise(original_samples=z_a, noise=noise, timesteps=latent_timestep)
     elif init_mode == 'focus_composite':
         composite = make_focus_composite(prepared, args.focus_a, args.focus_b, args.debug_dir)
         z_composite = encode_latent(pipe, composite, h, w, device)
-        latent_timestep = pipe.scheduler.timesteps[start].expand(z_composite.shape[0])
+        latent_timestep = schedule_plan['initial_noise_timestep'].expand(z_composite.shape[0])
         latents = pipe.scheduler.add_noise(original_samples=z_composite, noise=noise, timesteps=latent_timestep)
     else:
-        latents = noise
+        init_sigma = schedule_plan['initial_sigma']
+        if hasattr(init_sigma, 'to'):
+            init_sigma = init_sigma.to(device=device, dtype=noise.dtype)
+        latents = noise * init_sigma
+    if _as_float(schedule_plan['initial_noise_timestep']) != _as_float(schedule_plan['first_denoise_timestep']):
+        raise RuntimeError('Initial latent noise timestep does not match the first denoising timestep.')
     scales=[cfg.get('image_cross_attention_scale_a',1.0) if args.image_cross_attention_scale_a is None else args.image_cross_attention_scale_a]
     if args.condition_mode=='dual': scales.append(cfg.get('image_cross_attention_scale_b',1.0) if args.image_cross_attention_scale_b is None else args.image_cross_attention_scale_b)
     for t in ts:
@@ -202,7 +310,31 @@ def generate(pipe, image_encoder, image_processor, cfg, args, a_img, b_img=None)
             u,c=pred.chunk(2); pred=u+args.guidance_scale*(c-u)
         latents=pipe.scheduler.step(pred,t,latents,return_dict=False)[0]
     out=decode_pil(pipe,latents)
-    stats={'condition_mode':args.condition_mode,'checkpoint':str(args.checkpoint),'steps':args.steps,'strength':args.strength,'init_mode':init_mode,'img2img_schedule_mode':args.img2img_schedule_mode,'schedule mode':args.img2img_schedule_mode,'requested_steps':args.steps,'effective_steps':eff,'start_timestep':float(start_timestep.detach().float().cpu()) if hasattr(start_timestep, 'detach') else float(start_timestep),'latent shapes':{'a':list(z_a.shape),'b':list(z_b.shape) if z_b is not None else None,'final':list(latents.shape)},'vision token shapes':{'a':list(tok_a.shape),'b':list(tok_b.shape) if tok_b is not None else None},'image gate values':pipe.transformer.image_cross_attention_adapter.gate_values()[0],'output finite status':bool(torch.isfinite(latents).all().cpu()),'status':'success'}
+    stats={
+        'condition_mode':args.condition_mode,
+        'checkpoint':str(args.checkpoint),
+        'steps':args.steps,
+        'strength':args.strength,
+        'init_mode':init_mode,
+        'img2img_schedule_mode':args.img2img_schedule_mode,
+        'schedule mode':args.img2img_schedule_mode,
+        'requested_steps':args.steps,
+        'effective_steps':int(schedule_plan['effective_steps']),
+        'requested_strength':float(schedule_plan['requested_strength']),
+        'effective_strength':float(schedule_plan['effective_strength']),
+        't_start_index':int(schedule_plan['t_start_index']),
+        'initial_noise_timestep':_as_plain_number(schedule_plan['initial_noise_timestep']),
+        'first_denoise_timestep':_as_plain_number(schedule_plan['first_denoise_timestep']),
+        'initial_sigma':_as_float(schedule_plan['initial_sigma']),
+        'schedule_consistent':bool(schedule_plan['schedule_consistent']),
+        'scheduler_begin_index':int(schedule_plan['scheduler_begin_index']),
+        'scheduler_order':int(schedule_plan['scheduler_order']),
+        'latent shapes':{'a':list(z_a.shape),'b':list(z_b.shape) if z_b is not None else None,'final':list(latents.shape)},
+        'vision token shapes':{'a':list(tok_a.shape),'b':list(tok_b.shape) if tok_b is not None else None},
+        'image gate values':pipe.transformer.image_cross_attention_adapter.gate_values()[0],
+        'output finite status':bool(torch.isfinite(latents).all().cpu()),
+        'status':'success',
+    }
     return out, stats, prepared, size_info
 
 
